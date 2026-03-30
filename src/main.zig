@@ -15,44 +15,6 @@ const Call = struct {
     canceled: bool = false,
 };
 
-fn extractUri(header: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, header, "<")) |start| {
-        const end = std.mem.indexOf(u8, header[start..], ">") orelse return header;
-        return header[start + 1 .. start + end];
-    }
-    return header;
-}
-
-fn sendResponse(socket: *transport.UdpSocket, to: std.Io.net.IpAddress, buf: []u8, status: u16, reason: []const u8, req: sip.Request) !void {
-    const response = std.fmt.bufPrint(buf, "SIP/2.0 {d} {s}\r\n", .{ status, reason }) catch return error.BufferTooSmall;
-
-    const via_start = response.len;
-    const via_line = std.fmt.bufPrint(buf[via_start..], "Via: {s}\r\n", .{req.via}) catch return error.BufferTooSmall;
-    const from_start = via_start + via_line.len;
-    const from_line = std.fmt.bufPrint(buf[from_start..], "From: {s}\r\n", .{req.from}) catch return error.BufferTooSmall;
-
-    const to_start = from_start + from_line.len;
-    const to_line = std.fmt.bufPrint(buf[to_start..], "To: {s}\r\n", .{req.to}) catch return error.BufferTooSmall;
-    const call_start = to_start + to_line.len;
-    const call_line = std.fmt.bufPrint(buf[call_start..], "Call-ID: {s}\r\n", .{req.call_id}) catch return error.BufferTooSmall;
-
-    const cseq_start = call_start + call_line.len;
-    const cseq_line = std.fmt.bufPrint(buf[cseq_start..], "CSeq: {d} {s}\r\n", .{ req.cseq_num, req.cseq_method.toSlice() }) catch return error.BufferTooSmall;
-
-    const contact_start = cseq_start + cseq_line.len;
-    var total_len = contact_start;
-    if (req.contact) |c| {
-        const contact_line = std.fmt.bufPrint(buf[contact_start..], "Contact: {s}\r\n\r\n", .{c}) catch return error.BufferTooSmall;
-
-        total_len = contact_start + contact_line.len;
-    } else {
-        buf[contact_start] = '\r';
-        buf[contact_start + 1] = '\n';
-        total_len = contact_start + 2;
-    }
-    try socket.sendTo(buf[0..total_len], to);
-}
-
 pub fn main(init: std.process.Init) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -80,7 +42,6 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.log.info("PBX listening on 0.0.0.0:5060", .{});
-
     const pbx_addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 127, 0, 0, 1 }, .port = 5060 } };
 
     var recv_buf: [4096]u8 = undefined;
@@ -120,9 +81,9 @@ pub fn main(init: std.process.Init) !void {
                         var call_ctx: Call = if (calls.get(req.call_id)) |existing| existing else .{ .caller_addr = result.from };
                         if (!call_ctx.invite_forwarded) {
                             call_ctx.invite_forwarded = true;
-                            const dest_aor = extractUri(req.request_uri);
+                            const dest_aor = proxy.extractUri(req.request_uri);
                             const contact = reg.lookup(dest_aor) orelse {
-                                return try sendResponse(&socket, result.from, &resp_buf, 404, "Not Found", req);
+                                return try proxy.sendResponse(&socket, result.from, &resp_buf, 404, "Not Found", req);
                             };
 
                             call_ctx.callee_contact_addr = contact.address;

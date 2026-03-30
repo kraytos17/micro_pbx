@@ -1,9 +1,10 @@
 const std = @import("std");
-const msg = @import("sip/message.zig");
+
 const reg = @import("registrar.zig");
-const transport = @import("transport.zig");
-const sdp = @import("sdp.zig");
 const rtp = @import("rtp.zig");
+const sdp = @import("sdp.zig");
+const msg = @import("sip/message.zig");
+const transport = @import("transport.zig");
 
 pub fn handleMessage(req: msg.Request, from_addr: std.Io.net.IpAddress, registrar: *reg.Registrar, socket: *transport.UdpSocket, resp_buf: []u8, fwd_data: []const u8) !void {
     const dest_aor = extractUri(req.request_uri);
@@ -135,15 +136,15 @@ pub fn handleRegister(req: msg.Request, from_addr: std.Io.net.IpAddress, registr
     return try sendResponse(socket, from_addr, resp_buf, 200, "OK", req);
 }
 
-fn extractUri(header: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, header, "<")) |start| {
-        const end = std.mem.indexOf(u8, header[start..], ">") orelse return header;
+pub fn extractUri(header: []const u8) []const u8 {
+    if (std.mem.find(u8, header, "<")) |start| {
+        const end = std.mem.find(u8, header[start..], ">") orelse return header;
         return header[start + 1 .. start + end];
     }
     return header;
 }
 
-fn sendResponse(socket: *transport.UdpSocket, to: std.Io.net.IpAddress, buf: []u8, status: u16, reason: []const u8, req: msg.Request) !void {
+pub fn sendResponse(socket: *transport.UdpSocket, to: std.Io.net.IpAddress, buf: []u8, status: u16, reason: []const u8, req: msg.Request) !void {
     const response = std.fmt.bufPrint(buf, "SIP/2.0 {d} {s}\r\n", .{ status, reason }) catch return error.BufferTooSmall;
 
     const via_start = response.len;
