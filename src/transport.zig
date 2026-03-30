@@ -36,6 +36,11 @@ pub const UdpSocket = struct {
     pub fn sendTo(self: *UdpSocket, buf: []const u8, to: net.IpAddress) !void {
         self.socket.send(self.io, &to, buf) catch return error.SendFailed;
     }
+
+    pub fn sendToPort(self: *UdpSocket, buf: []const u8, ip: net.IpAddress, port: u16) !void {
+        const addr = net.IpAddress{ .ip4 = net.Ip4Address{ .bytes = ip.ip4.bytes, .port = port } };
+        try self.sendTo(buf, addr);
+    }
 };
 
 test "UdpSocket init and deinit" {
@@ -54,7 +59,6 @@ test "UdpSocket send and receive loopback" {
     defer receiver.deinit();
 
     const receiver_addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(receiver.socket.address.ip4.port) };
-
     const test_data = "Hello UDP";
     try sender.sendTo(test_data, receiver_addr);
 

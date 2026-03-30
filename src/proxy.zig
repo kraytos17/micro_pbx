@@ -2,6 +2,8 @@ const std = @import("std");
 const msg = @import("sip/message.zig");
 const reg = @import("registrar.zig");
 const transport = @import("transport.zig");
+const sdp = @import("sdp.zig");
+const rtp = @import("rtp.zig");
 
 pub fn handleMessage(req: msg.Request, from_addr: std.Io.net.IpAddress, registrar: *reg.Registrar, socket: *transport.UdpSocket, resp_buf: []u8, fwd_data: []const u8) !void {
     const dest_aor = extractUri(req.request_uri);
@@ -26,29 +28,46 @@ pub fn handleOptions(req: msg.Request, from_addr: std.Io.net.IpAddress, registra
     }
 }
 
-pub fn handleAck(req: msg.Request, dest_addr: std.Io.net.IpAddress, registrar: *reg.Registrar, socket: *transport.UdpSocket, buf: []u8) !void {
-    _ = registrar;
-    _ = req;
-    try socket.sendTo(buf, dest_addr);
-}
-
-pub fn handleBye(req: msg.Request, dest_addr: std.Io.net.IpAddress, registrar: *reg.Registrar, socket: *transport.UdpSocket, buf: []u8) !void {
-    _ = registrar;
-    _ = req;
-    try socket.sendTo(buf, dest_addr);
-}
-
-pub fn handleCancel(req: msg.Request, caller_addr: std.Io.net.IpAddress, registrar: *reg.Registrar, socket: *transport.UdpSocket, resp_buf: []u8, fwd_buf: []u8) !void {
-    try sendResponse(socket, caller_addr, resp_buf, 200, "OK", req);
-
+pub fn handleAck(req: msg.Request, dest_addr: std.Io.net.IpAddress, registrar: *reg.Registrar, socket: *transport.UdpSocket, pbx_addr: std.Io.net.IpAddress, branch: []const u8, fwd_buf: []u8) !void {
     const dest_aor = extractUri(req.request_uri);
     const contact = registrar.lookup(dest_aor);
-    if (contact) |c| {
-        const forwarded = try buildCancelRequest(req, c.address, fwd_buf);
-        try socket.sendTo(forwarded, c.address);
-    }
+    const actual_dest = if (contact) |c| c.address else dest_addr;
+
+    const forwarded = try buildForwardedRequest(req, pbx_addr, branch, fwd_buf);
+    try socket.sendTo(forwarded, actual_dest);
 }
 
+pub fn handleBye(req: msg.Request, dest_addr: std.Io.net.IpAddress, registrar: *reg.Registrar, socket: *transport.UdpSocket, pbx_addr: std.Io.net.IpAddress, branch: []const u8, fwd_buf: []u8) !void {
+    const dest_aor = extractUri(req.request_uri);
+    const contact = registrar.lookup(dest_aor);
+    const actual_dest = if (contact) |c| c.address else dest_addr;
+
+    const forwarded = try buildForwardedRequest(req, pbx_addr, branch, fwd_buf);
+    try socket.sendTo(forwarded, actual_dest);
+}
+
+pub fn handleCancel(req: msg.Request, caller_addr: std.Io.net.IpAddress, callee_addr: std.Io.net.IpAddress, socket: *transport.UdpSocket, resp_buf: []u8, fwd_buf: []u8) !void {
+    try sendResponse(socket, caller_addr, resp_buf, 200, "OK", req);
+    const forwarded = try buildCancelRequest(req, callee_addr, fwd_buf);
+    try socket.sendTo(forwarded, callee_addr);
+}
+
+fn stripTopVia(raw: []const u8, out: []u8) []u8 {
+    const via_start = std.mem.indexOf(u8, raw, "Via: ") orelse {
+        @memcpy(out[0..raw.len], raw);
+        return out[0..raw.len];
+    };
+    const line_end = std.mem.indexOfPos(u8, raw, via_start, "\r\n") orelse {
+        @memcpy(out[0..raw.len], raw);
+        return out[0..raw.len];
+    };
+
+    const via_line_end = line_end + 2; // include \r\n
+    const after_via = raw[via_line_end..];
+    @memcpy(out[0..via_start], raw[0..via_start]);
+    @memcpy(out[via_start..][0..after_via.len], after_via);
+    return out[0 .. raw.len - (via_line_end - via_start)];
+}
 fn buildCancelRequest(req: msg.Request, dest_addr: std.Io.net.IpAddress, buf: []u8) ![]u8 {
     var offset: usize = 0;
     offset += (std.fmt.bufPrint(buf[offset..], "CANCEL {s} SIP/2.0\r\n", .{req.request_uri}) catch return error.BufferTooSmall).len;
@@ -66,9 +85,26 @@ fn buildCancelRequest(req: msg.Request, dest_addr: std.Io.net.IpAddress, buf: []
     return buf[0..offset];
 }
 
-pub fn handleResponse(resp: msg.Response, caller_addr: std.Io.net.IpAddress, socket: *transport.UdpSocket, buf: []u8) !void {
-    _ = resp;
-    try socket.sendTo(buf, caller_addr);
+pub fn handleResponse(resp: msg.Response, caller_addr: std.Io.net.IpAddress, socket: *transport.UdpSocket, buf: []u8, rtp_manager: *rtp.Manager, allocator: std.mem.Allocator, fwd_buf: []u8) !void {
+    if (resp.status_code >= 200 and resp.status_code < 300 and resp.cseq_method == .INVITE) {
+        if (rtp_manager.getSession(resp.call_id)) |session| {
+            if (resp.body.len > 0) {
+                const callee_sdp = try sdp.parseSdp(resp.body);
+                session.callee_ip = caller_addr;
+                session.callee_payload_type = callee_sdp.payload_type;
+
+                const rewritten_sdp = try sdp.rewriteSdp(resp.body, "127.0.0.1", session.callee_rtp_port, allocator);
+                defer allocator.free(rewritten_sdp);
+
+                const rewritten_buf = try buildResponseWithSdp(resp, fwd_buf, rewritten_sdp, false);
+                try socket.sendTo(rewritten_buf, caller_addr);
+                return;
+            }
+        }
+    }
+
+    const stripped = stripTopVia(buf, fwd_buf);
+    try socket.sendTo(stripped, caller_addr);
 }
 
 pub fn handleInvite(req: msg.Request, from_addr: std.Io.net.IpAddress, registrar: *reg.Registrar, socket: *transport.UdpSocket, pbx_addr: std.Io.net.IpAddress, resp_buf: []u8, fwd_buf: []u8, allocator: std.mem.Allocator, io: std.Io) !void {
@@ -78,7 +114,6 @@ pub fn handleInvite(req: msg.Request, from_addr: std.Io.net.IpAddress, registrar
     };
 
     try sendResponse(socket, from_addr, resp_buf, 100, "Trying", req);
-
     const branch = try generateBranch(allocator, io);
     defer allocator.free(branch);
 
@@ -135,11 +170,10 @@ fn sendResponse(socket: *transport.UdpSocket, to: std.Io.net.IpAddress, buf: []u
         buf[contact_start + 1] = '\n';
         total_len = contact_start + 2;
     }
-
     try socket.sendTo(buf[0..total_len], to);
 }
 
-fn generateBranch(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
+pub fn generateBranch(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     var buf: [8]u8 = undefined;
     std.Io.random(io, &buf);
     const suffix = std.mem.readInt(u64, &buf, .little);
@@ -148,7 +182,6 @@ fn generateBranch(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
 
 fn buildForwardedRequest(req: msg.Request, pbx_addr: std.Io.net.IpAddress, branch: []const u8, buf: []u8) ![]u8 {
     var offset: usize = 0;
-
     offset += (std.fmt.bufPrint(buf[offset..], "{s} {s} SIP/2.0\r\n", .{ req.method.toSlice(), req.request_uri }) catch return error.BufferTooSmall).len;
 
     const via_proto = if (pbx_addr.ip4.port != 0) "SIP/2.0/UDP" else "SIP/2.0/UDP";
@@ -177,7 +210,7 @@ fn buildForwardedRequest(req: msg.Request, pbx_addr: std.Io.net.IpAddress, branc
 
 fn buildOptionsRequest(req: msg.Request, dest_addr: std.Io.net.IpAddress, buf: []u8) ![]u8 {
     var offset: usize = 0;
-    offset += (std.fmt.bufPrint(buf[offset..], "SIP/2.0 200 OK\r\n", .{}) catch return error.BufferTooSmall).len;
+    offset += (std.fmt.bufPrint(buf[offset..], "OPTIONS {s} SIP/2.0\r\n", .{req.request_uri}) catch return error.BufferTooSmall).len;
 
     const via_proto = if (dest_addr.ip4.port != 0) "SIP/2.0/UDP" else "SIP/2.0/UDP";
     offset += (std.fmt.bufPrint(buf[offset..], "Via: {s} {d}.{d}.{d}.{d}:{d}\r\n", .{ via_proto, dest_addr.ip4.bytes[0], dest_addr.ip4.bytes[1], dest_addr.ip4.bytes[2], dest_addr.ip4.bytes[3], dest_addr.ip4.port }) catch return error.BufferTooSmall).len;
@@ -191,6 +224,39 @@ fn buildOptionsRequest(req: msg.Request, dest_addr: std.Io.net.IpAddress, buf: [
     offset += (std.fmt.bufPrint(buf[offset..], "Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, REGISTER, MESSAGE\r\n", .{}) catch return error.BufferTooSmall).len;
 
     offset += (std.fmt.bufPrint(buf[offset..], "\r\n", .{}) catch return error.BufferTooSmall).len;
+    return buf[0..offset];
+}
+
+fn buildResponseWithSdp(resp: msg.Response, buf: []u8, sdp_body: []const u8, include_via: bool) ![]u8 {
+    var offset: usize = 0;
+    offset += (std.fmt.bufPrint(buf[offset..], "SIP/2.0 {d} {s}\r\n", .{ resp.status_code, resp.reason_phrase }) catch return error.BufferTooSmall).len;
+
+    if (include_via) {
+        offset += (std.fmt.bufPrint(buf[offset..], "Via: {s}\r\n", .{resp.via}) catch return error.BufferTooSmall).len;
+    }
+
+    offset += (std.fmt.bufPrint(buf[offset..], "From: {s}\r\n", .{resp.from}) catch return error.BufferTooSmall).len;
+    offset += (std.fmt.bufPrint(buf[offset..], "To: {s}", .{resp.to}) catch return error.BufferTooSmall).len;
+    if (resp.to_tag) |tag| {
+        offset += (std.fmt.bufPrint(buf[offset..], ";tag={s}", .{tag}) catch return error.BufferTooSmall).len;
+    }
+
+    offset += (std.fmt.bufPrint(buf[offset..], "\r\n", .{}) catch return error.BufferTooSmall).len;
+    offset += (std.fmt.bufPrint(buf[offset..], "Call-ID: {s}\r\n", .{resp.call_id}) catch return error.BufferTooSmall).len;
+
+    offset += (std.fmt.bufPrint(buf[offset..], "CSeq: {d} {s}\r\n", .{ resp.cseq_num, resp.cseq_method.toSlice() }) catch return error.BufferTooSmall).len;
+
+    if (resp.contact) |c| {
+        offset += (std.fmt.bufPrint(buf[offset..], "Contact: {s}\r\n", .{c}) catch return error.BufferTooSmall).len;
+    }
+
+    offset += (std.fmt.bufPrint(buf[offset..], "Content-Type: application/sdp\r\n", .{}) catch return error.BufferTooSmall).len;
+
+    offset += (std.fmt.bufPrint(buf[offset..], "\r\n", .{}) catch return error.BufferTooSmall).len;
+    if (sdp_body.len > 0) {
+        @memcpy(buf[offset..][0..sdp_body.len], sdp_body);
+        offset += sdp_body.len;
+    }
     return buf[0..offset];
 }
 
