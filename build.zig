@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "pbx",
+        .name = "micro_pbx",
         .root_module = exe_module,
     });
 
