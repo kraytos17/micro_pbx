@@ -1,5 +1,18 @@
 const std = @import("std");
 
+pub fn extractUsername(aor: []const u8) ?[]const u8 {
+    const sip_prefix = "sip:";
+    if (!std.mem.startsWith(u8, aor, sip_prefix)) {
+        return null;
+    }
+
+    const after_sip = aor[sip_prefix.len..];
+    const at_pos = std.mem.find(u8, after_sip, "@") orelse {
+        return after_sip;
+    };
+    return after_sip[0..at_pos];
+}
+
 pub const Contact = struct {
     address: std.Io.net.IpAddress,
     expires_at: i64,
@@ -54,22 +67,66 @@ pub const Registrar = struct {
                 .cseq = cseq,
             });
         }
+
+        if (extractUsername(aor)) |username| {
+            const username_key = try std.fmt.allocPrint(self.allocator, "sip:{s}", .{username});
+            if (self.map.getPtr(username_key)) |entry| {
+                self.allocator.free(username_key);
+                self.allocator.free(entry.call_id);
+                entry.call_id = try self.allocator.dupe(u8, call_id);
+                entry.address = contact;
+                entry.expires_at = expires_at;
+                entry.cseq = cseq;
+            } else {
+                const call_id_owned = try self.allocator.dupe(u8, call_id);
+                errdefer self.allocator.free(call_id_owned);
+                errdefer self.allocator.free(username_key);
+                try self.map.put(username_key, .{
+                    .address = contact,
+                    .expires_at = expires_at,
+                    .call_id = call_id_owned,
+                    .cseq = cseq,
+                });
+            }
+        }
     }
 
     pub fn lookup(self: *Registrar, aor: []const u8) ?Contact {
-        const entry = self.map.get(aor) orelse return null;
         const now = std.Io.Timestamp.now(self.io, std.Io.Clock.real).toSeconds();
-        if (now > entry.expires_at) {
-            _ = self.map.remove(aor);
-            return null;
+        if (self.map.get(aor)) |entry| {
+            if (now > entry.expires_at) {
+                _ = self.map.remove(aor);
+                return null;
+            }
+            return entry;
         }
-        return entry;
+        if (extractUsername(aor)) |username| {
+            const username_key = std.fmt.allocPrint(self.allocator, "sip:{s}", .{username}) catch return null;
+            defer self.allocator.free(username_key);
+
+            if (self.map.get(username_key)) |entry| {
+                if (now > entry.expires_at) {
+                    _ = self.map.remove(username_key);
+                    return null;
+                }
+                return entry;
+            }
+        }
+        return null;
     }
 
     pub fn unregister(self: *Registrar, aor: []const u8) void {
         if (self.map.fetchRemove(aor)) |kv| {
             self.allocator.free(kv.key);
             self.allocator.free(kv.value.call_id);
+        }
+        if (extractUsername(aor)) |username| {
+            const username_key = std.fmt.allocPrint(self.allocator, "sip:{s}", .{username}) catch return;
+            defer self.allocator.free(username_key);
+            if (self.map.fetchRemove(username_key)) |kv| {
+                self.allocator.free(kv.key);
+                self.allocator.free(kv.value.call_id);
+            }
         }
     }
 };
@@ -153,4 +210,21 @@ test "register multiple users" {
     try std.testing.expect(registrar.lookup("sip:bob@pbx.local") != null);
     try std.testing.expect(registrar.lookup("sip:charlie@pbx.local") != null);
     try std.testing.expect(registrar.lookup("sip:dave@pbx.local") == null);
+}
+
+test "lookup by username works across different domains" {
+    const io = std.testing.io;
+    var registrar = Registrar.init(std.testing.allocator, io);
+    defer registrar.deinit();
+
+    const addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 5 }, .port = 5060 } };
+
+    try registrar.register("sip:alice@pbx.local", addr, 3600, "callid1", 1);
+    const found1 = registrar.lookup("sip:alice@127.0.0.1:5060");
+    try std.testing.expect(found1 != null);
+    try std.testing.expectEqual(addr, found1.?.address);
+
+    const found2 = registrar.lookup("sip:alice");
+    try std.testing.expect(found2 != null);
+    try std.testing.expectEqual(addr, found2.?.address);
 }
