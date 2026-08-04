@@ -110,7 +110,10 @@ pub const Registrar = struct {
         const now = std.Io.Timestamp.now(self.io, std.Io.Clock.real).toSeconds();
         if (self.map.get(aor)) |entry| {
             if (now > entry.expires_at) {
-                _ = self.map.remove(aor);
+                if (self.map.fetchRemove(aor)) |kv| {
+                    self.allocator.free(kv.key);
+                    self.allocator.free(kv.value.call_id);
+                }
                 return null;
             }
             return entry;
@@ -121,7 +124,10 @@ pub const Registrar = struct {
 
             if (self.map.get(username_key)) |entry| {
                 if (now > entry.expires_at) {
-                    _ = self.map.remove(username_key);
+                    if (self.map.fetchRemove(username_key)) |kv| {
+                        self.allocator.free(kv.key);
+                        self.allocator.free(kv.value.call_id);
+                    }
                     return null;
                 }
                 return entry;

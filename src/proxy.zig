@@ -139,6 +139,7 @@ fn buildCancelRequest(
 pub fn handleResponse(
     resp: msg.Response,
     caller_addr: std.Io.net.IpAddress,
+    callee_addr: std.Io.net.IpAddress,
     socket: *transport.UdpSocket,
     buf: []u8,
     rtp_sessions: *rtp.Sessions,
@@ -149,7 +150,7 @@ pub fn handleResponse(
         if (rtp_sessions.getSession(resp.call_id)) |session| {
             if (resp.body.len > 0) {
                 const callee_sdp = try sdp.parseSdp(resp.body);
-                session.callee_ip = caller_addr;
+                session.callee_ip = callee_addr;
                 session.callee_payload_type = callee_sdp.payload_type;
 
                 const rewritten_sdp = try sdp.rewriteSdp(resp.body, "127.0.0.1", session.callee_rtp_port, allocator);

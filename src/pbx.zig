@@ -7,6 +7,7 @@ const parser = @import("sip/parser.zig");
 const registrar = @import("registrar.zig");
 const proxy = @import("proxy.zig");
 const rtp = @import("rtp.zig");
+const sdp = @import("sdp.zig");
 const call = @import("call.zig");
 const txn = @import("sip/transaction.zig");
 
@@ -173,6 +174,18 @@ pub const Pbx = struct {
 
             call_ctx.callee_contact_addr = contact.address;
 
+            // Create an RTP session from the caller's SDP so the media relay
+            // can rewrite the callee's SDP and open relay sockets on ACK.
+            if (req.content_type) |ct| {
+                if (std.mem.eql(u8, ct, "application/sdp") and req.body.len > 0) {
+                    if (sdp.parseSdp(req.body)) |media| {
+                        _ = try self.rtp_sessions.createSession(req.call_id, media.port, from, media.payload_type);
+                    } else |_| {
+                        log.warn("could not parse caller SDP in INVITE", .{});
+                    }
+                }
+            }
+
             const invite_result = try proxy.handleInvite(req, from, contact, &self.socket, self.pbx_addr, resp_buf, fwd_buf, arena.allocator(), self.io);
 
             try self.txn_layer.createInviteTransaction(invite_result.branch, invite_result.forwarded, contact.address);
@@ -316,7 +329,7 @@ pub const Pbx = struct {
                     if (call_ctx.state == .proceeding or call_ctx.state == .ringing) {
                         call_ctx.state = .ringing;
                         call_ctx.callee_resp_addr = from;
-                        proxy.handleResponse(resp, dest_addr, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
+                        proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
                             log.err("handleResponse 1xx: {}", .{err});
                         };
                     }
@@ -327,19 +340,19 @@ pub const Pbx = struct {
                             call_ctx.state = .answered;
                             log.info("call {s} answered ({d} {s})", .{ resp.call_id, resp.status_code, resp.reason_phrase });
                             call_ctx.callee_resp_addr = from;
-                            proxy.handleResponse(resp, dest_addr, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
+                            proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
                                 log.err("handleResponse 2xx: {}", .{err});
                             };
                         } else if (call_ctx.state == .canceling) {
                             call_ctx.state = .answered;
                             log.info("call {s} answered after CANCEL race ({d} {s})", .{ resp.call_id, resp.status_code, resp.reason_phrase });
                             call_ctx.callee_resp_addr = from;
-                            proxy.handleResponse(resp, dest_addr, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
+                            proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
                                 log.err("handleResponse 2xx race: {}", .{err});
                             };
                         }
                     } else {
-                        proxy.handleResponse(resp, dest_addr, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
+                        proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
                             log.err("handleResponse non-invite: {}", .{err});
                         };
                     }
@@ -348,7 +361,7 @@ pub const Pbx = struct {
                     if (call_ctx.state == .canceling) {
                         call_ctx.state = .terminated;
                         log.info("call {s} terminated (487)", .{resp.call_id});
-                        proxy.handleResponse(resp, dest_addr, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
+                        proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
                             log.err("handleResponse 487: {}", .{err});
                         };
                         call.removeCall(&self.calls, self.allocator, resp.call_id);
@@ -358,7 +371,7 @@ pub const Pbx = struct {
                     if (call_ctx.state != .terminated) {
                         call_ctx.state = .terminated;
                         log.info("call {s} terminated ({d} {s})", .{ resp.call_id, resp.status_code, resp.reason_phrase });
-                        proxy.handleResponse(resp, dest_addr, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
+                        proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
                             log.err("handleResponse final: {}", .{err});
                         };
                         call.removeCall(&self.calls, self.allocator, resp.call_id);
@@ -366,7 +379,7 @@ pub const Pbx = struct {
                 },
             }
         } else {
-            proxy.handleResponse(resp, dest_addr, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
+            proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
                 log.err("handleResponse no-ctx: {}", .{err});
             };
         }
@@ -375,4 +388,315 @@ pub const Pbx = struct {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+const test_alice_addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 127, 0, 0, 1 }, .port = 5070 } };
+const test_bob_addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 127, 0, 0, 1 }, .port = 5072 } };
+
+fn parseRequest(raw: []const u8) !msg.Request {
+    return (try parser.parse(raw)).request;
+}
+
+fn parseResponse(raw: []const u8) !msg.Response {
+    return (try parser.parse(raw)).response;
+}
+
+fn registerUser(pbx: *Pbx, name: []const u8, from: std.Io.net.IpAddress, resp_buf: []u8) !void {
+    var raw_buf: [512]u8 = undefined;
+    const raw = std.fmt.bufPrint(&raw_buf, "REGISTER sip:{s}@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKreg{s}\r\n" ++
+        "From: <sip:{s}@127.0.0.1:5060>;tag=tag{s}\r\n" ++
+        "To: <sip:{s}@127.0.0.1:5060>\r\n" ++
+        "Call-ID: {s}reg@127.0.0.1\r\n" ++
+        "CSeq: 1 REGISTER\r\n" ++
+        "Contact: <sip:{s}@127.0.0.1>\r\n" ++
+        "Expires: 3600\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", .{ name, name, name, name, name, name, name }) catch unreachable;
+    const req = try parseRequest(raw);
+    try pbx.onRegister(req, from, resp_buf);
+}
+
+fn inviteBob(pbx: *Pbx, call_id: []const u8, branch: []const u8, from: std.Io.net.IpAddress, with_sdp: bool, resp_buf: []u8, fwd_buf: []u8) !void {
+    const sdp_body =
+        "v=0\r\n" ++
+        "o=alice 123456 789 IN IP4 127.0.0.1\r\n" ++
+        "s=Session\r\n" ++
+        "c=IN IP4 127.0.0.1\r\n" ++
+        "m=audio 20000 RTP/AVP 0\r\n";
+    var raw_buf: [1024]u8 = undefined;
+    const raw = std.fmt.bufPrint(&raw_buf, "INVITE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch={s}\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>\r\n" ++
+        "Call-ID: {s}\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "Content-Type: application/sdp\r\n" ++
+        "Content-Length: {d}\r\n" ++
+        "\r\n" ++
+        "{s}", .{ branch, call_id, sdp_body.len, if (with_sdp) sdp_body else "" }) catch unreachable;
+    const req = try parseRequest(raw);
+    try pbx.onInvite(req, from, resp_buf, fwd_buf);
+}
+
+fn deliverResponse(pbx: *Pbx, raw: []const u8, from: std.Io.net.IpAddress, fwd_buf: []u8) !void {
+    var data_buf: [1024]u8 = undefined;
+    @memcpy(data_buf[0..raw.len], raw);
+    const data = data_buf[0..raw.len];
+    const resp = try parseResponse(data);
+    pbx.handleResponse(resp, data, from, fwd_buf);
+}
+
+test "e2e full call flow REGISTER INVITE 180 200 ACK BYE" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try std.testing.expect(server.reg.lookup("sip:alice") != null);
+    try std.testing.expect(server.reg.lookup("sip:alice@127.0.0.1:5060") != null);
+
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+    try std.testing.expect(server.reg.lookup("sip:bob") != null);
+
+    const call_id = "call-1";
+    try inviteBob(&server, call_id, "z9hG4bKinv1", test_alice_addr, false, &resp_buf, &fwd_buf);
+    const call_ctx = server.calls.get(call_id).?;
+    try std.testing.expect(call_ctx.state == .proceeding);
+    try std.testing.expectEqual(test_bob_addr, call_ctx.callee_contact_addr.?);
+
+    // 180 Ringing from callee
+    try deliverResponse(&server, "SIP/2.0 180 Ringing\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKinv1\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-1\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", test_bob_addr, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id).?.state == .ringing);
+
+    // 200 OK from callee
+    try deliverResponse(&server, "SIP/2.0 200 OK\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKinv1\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-1\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", test_bob_addr, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id).?.state == .answered);
+
+    // ACK from caller
+    const ack_req = try parseRequest("ACK sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKack1\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-1\r\n" ++
+        "CSeq: 1 ACK\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onAck(ack_req, test_alice_addr, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id).?.state == .established);
+
+    // BYE from caller
+    const bye_req = try parseRequest("BYE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbye1\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-1\r\n" ++
+        "CSeq: 2 BYE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onBye(bye_req, test_alice_addr, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id) == null);
+}
+
+test "e2e INVITE unknown user 404 and retransmission cache" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+
+    var raw_buf: [1024]u8 = undefined;
+    const raw = std.fmt.bufPrint(&raw_buf, "INVITE sip:nobody@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK404\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:nobody@127.0.0.1:5060>\r\n" ++
+        "Call-ID: call-404@127.0.0.1\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", .{}) catch unreachable;
+    const req = try parseRequest(raw);
+    try server.onInvite(req, test_alice_addr, &resp_buf, &fwd_buf);
+    try std.testing.expect(server.calls.get("call-404@127.0.0.1") != null);
+    // 404 cached under client branch
+    const cached_txn = server.txn_layer.getTransaction("z9hG4bK404", .INVITE).?;
+    try std.testing.expect(cached_txn.response_buf != null);
+
+    // Retransmission: same branch replays cached 404, no new call mutation
+    const before = server.calls.get("call-404@127.0.0.1");
+    try server.onInvite(req, test_alice_addr, &resp_buf, &fwd_buf);
+    const after = server.calls.get("call-404@127.0.0.1");
+    try std.testing.expect(before != null and after != null);
+}
+
+test "e2e CANCEL then 2xx race goes to answered" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+
+    const call_id = "call-race";
+    try inviteBob(&server, call_id, "z9hG4bKrace", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id).?.state == .proceeding);
+
+    const cancel_req = try parseRequest("CANCEL sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKcancel\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>\r\n" ++
+        "Call-ID: call-race\r\n" ++
+        "CSeq: 1 CANCEL\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onCancel(cancel_req, test_alice_addr, &resp_buf, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id).?.state == .canceling);
+
+    // Callee's 2xx arrives anyway (race)
+    try deliverResponse(&server, "SIP/2.0 200 OK\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKrace\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-race\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", test_bob_addr, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id).?.state == .answered);
+}
+
+test "e2e CANCEL then 487 terminates and removes call" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+
+    const call_id = "call-487";
+    try inviteBob(&server, call_id, "z9hG4bK487", test_alice_addr, false, &resp_buf, &fwd_buf);
+
+    const cancel_req = try parseRequest("CANCEL sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKcancel2\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>\r\n" ++
+        "Call-ID: call-487\r\n" ++
+        "CSeq: 1 CANCEL\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onCancel(cancel_req, test_alice_addr, &resp_buf, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id).?.state == .canceling);
+
+    try deliverResponse(&server, "SIP/2.0 487 Request Terminated\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK487\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-487\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", test_bob_addr, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id) == null);
+}
+
+test "e2e registration expiry with short TTL" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var raw_buf: [512]u8 = undefined;
+    const raw = std.fmt.bufPrint(&raw_buf, "REGISTER sip:short@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKshort\r\n" ++
+        "From: <sip:short@127.0.0.1:5060>;tag=tagshort\r\n" ++
+        "To: <sip:short@127.0.0.1:5060>\r\n" ++
+        "Call-ID: shortreg@127.0.0.1\r\n" ++
+        "CSeq: 1 REGISTER\r\n" ++
+        "Contact: <sip:short@127.0.0.1>\r\n" ++
+        "Expires: 1\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", .{}) catch unreachable;
+    const req = try parseRequest(raw);
+
+    var resp_buf: [4096]u8 = undefined;
+    try server.onRegister(req, test_alice_addr, &resp_buf);
+    try std.testing.expect(server.reg.lookup("sip:short") != null);
+
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(2000), .real) catch unreachable;
+    try std.testing.expect(server.reg.lookup("sip:short") == null);
+}
+
+test "e2e RTP session created on INVITE with SDP, sockets opened on ACK" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+
+    const call_id = "call-rtp";
+    try inviteBob(&server, call_id, "z9hG4bKrtp", test_alice_addr, true, &resp_buf, &fwd_buf);
+
+    const session = server.rtp_sessions.getSession(call_id).?;
+    try std.testing.expectEqual(@as(u16, 20000), session.caller_rtp_port);
+    try std.testing.expectEqual(@as(u7, 0), session.caller_payload_type);
+
+    try deliverResponse(&server, "SIP/2.0 200 OK\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKrtp\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-rtp\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Contact: <sip:bob@127.0.0.1>\r\n" ++
+        "Content-Type: application/sdp\r\n" ++
+        "Content-Length: 82\r\n" ++
+        "\r\n" ++
+        "v=0\r\n" ++
+        "o=bob 123456 789 IN IP4 127.0.0.1\r\n" ++
+        "s=Session\r\n" ++
+        "c=IN IP4 127.0.0.1\r\n" ++
+        "m=audio 4000 RTP/AVP 0\r\n", test_bob_addr, &fwd_buf);
+    try std.testing.expectEqual(test_bob_addr, session.callee_ip);
+    try std.testing.expectEqual(@as(u7, 0), session.callee_payload_type);
+
+    // ACK opens the two relay sockets
+    const ack_req = try parseRequest("ACK sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKackrtp\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-rtp\r\n" ++
+        "CSeq: 1 ACK\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onAck(ack_req, test_alice_addr, &fwd_buf);
+    try std.testing.expectEqual(@as(usize, 2), server.rtp_sockets.items.len);
+
+    // BYE removes the session
+    const bye_req = try parseRequest("BYE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbyertp\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-rtp\r\n" ++
+        "CSeq: 2 BYE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onBye(bye_req, test_alice_addr, &fwd_buf);
+    try std.testing.expect(server.rtp_sessions.getSession(call_id) == null);
 }
