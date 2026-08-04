@@ -3,6 +3,8 @@
 const std = @import("std");
 const testing = std.testing;
 
+const log = std.log.scoped(.call);
+
 /// Lifecycle phases a SIP dialog moves through.
 pub const CallState = enum {
     proceeding,
@@ -51,7 +53,7 @@ pub fn putCall(
 }
 
 pub fn addressEqual(a: std.Io.net.IpAddress, b: std.Io.net.IpAddress) bool {
-    return std.mem.eql(u8, &a.ip4.bytes, &b.ip4.bytes) and a.ip4.port == b.ip4.port;
+    return std.Io.net.IpAddress.eql(&a, &b);
 }
 
 test "addressEqual returns true for same address" {

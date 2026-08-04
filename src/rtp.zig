@@ -4,6 +4,8 @@ const std = @import("std");
 const net = std.Io.net;
 const transport = @import("transport.zig");
 
+const log = std.log.scoped(.rtp);
+
 /// Parsed RTP packet header.
 pub const Header = packed struct {
     csrc_count: u4,
@@ -29,11 +31,11 @@ pub const Header = packed struct {
     }
 
     pub fn payload(self: *const Header, data: []const u8) []const u8 {
-        const header_len = 12 + (self.csrc_count * 4);
+        var header_len: usize = 12 + (self.csrc_count * 4);
         if (self.extension == 1) {
             if (header_len + 4 > data.len) return "";
-            const ext_len = std.mem.bytesAsValue(u16, data[header_len + 2 ..][0..2]);
-            _ = ext_len;
+            const ext_words = std.mem.bigToNative(u16, std.mem.bytesAsValue(u16, data[header_len + 2 ..][0..2]).*);
+            header_len += 4 + (@as(usize, ext_words) * 4);
         }
         if (header_len > data.len) return "";
         var payload_data = data[header_len..];
@@ -132,12 +134,12 @@ pub fn handleRtpPacket(
         const session = entry.value_ptr;
         if (from_addr.ip4.port == session.caller_rtp_port) {
             if (session.callee_ip.ip4.port != 0) {
-                std.debug.print("RTP: Forwarding from caller to callee: {} bytes\n", .{packet.len});
+                log.debug("RTP: Forwarding from caller to callee: {} bytes", .{packet.len});
                 try sip_socket.sendToPort(packet, session.callee_ip, session.callee_rtp_port);
                 return;
             }
         } else if (from_addr.ip4.port == session.callee_rtp_port) {
-            std.debug.print("RTP: Forwarding from callee to caller: {} bytes\n", .{packet.len});
+            log.debug("RTP: Forwarding from callee to caller: {} bytes", .{packet.len});
             try sip_socket.sendToPort(packet, session.caller_ip, session.caller_rtp_port);
             return;
         }
@@ -164,4 +166,96 @@ test "RTP header parse basic" {
     try std.testing.expectEqual(@as(u7, 0), h.payload_type);
     try std.testing.expectEqual(@as(u16, 0x1234), h.sequence);
     try std.testing.expectEqual(@as(u32, 1), h.ssrc);
+}
+
+test "RTP payload with extension header skips extension bytes" {
+    // Version 2, X=1, no CSRC, PT=0
+    // 12-byte header, then 4-byte ext header (ext len = 1 word), then 4 ext bytes, then 4 payload bytes
+    var buf: [20]u8 = [_]u8{0} ** 20;
+    buf[0] = 0x90; // V=2, X=1
+    buf[1] = 0x00;
+    buf[2] = 0x12;
+    buf[3] = 0x34;
+    buf[8] = 0x00;
+    buf[9] = 0x01;
+    buf[10] = 0x00;
+    buf[11] = 0x00;
+
+    // extension header: profile (2 bytes) + length in 32-bit words (big-endian 0x0001)
+    buf[12] = 0xBE;
+    buf[13] = 0xDE;
+    buf[14] = 0x00;
+    buf[15] = 0x01;
+
+    // 4 bytes of extension data
+    buf[16] = 0xAA;
+    buf[17] = 0xBB;
+    buf[18] = 0xCC;
+    buf[19] = 0xDD;
+
+    const h = try Header.parse(buf[0..12]);
+    try std.testing.expectEqual(@as(u1, 1), h.extension);
+    const payload = h.payload(&buf);
+    try std.testing.expectEqual(@as(usize, 0), payload.len);
+}
+
+test "RTP payload with extension returns trailing payload" {
+    var buf: [24]u8 = [_]u8{0} ** 24;
+    buf[0] = 0x90; // V=2, X=1
+    buf[1] = 0x00;
+    buf[2] = 0x12;
+    buf[3] = 0x34;
+    buf[8] = 0x00;
+    buf[9] = 0x01;
+    buf[10] = 0x00;
+    buf[11] = 0x00;
+
+    // ext header: length = 1 word
+    buf[12] = 0xBE;
+    buf[13] = 0xDE;
+    buf[14] = 0x00;
+    buf[15] = 0x01;
+
+    // 4 bytes extension data
+    buf[16] = 0xAA;
+    buf[17] = 0xBB;
+    buf[18] = 0xCC;
+    buf[19] = 0xDD;
+
+    // 4 bytes of actual payload
+    buf[20] = 0x11;
+    buf[21] = 0x22;
+    buf[22] = 0x33;
+    buf[23] = 0x44;
+
+    const h = try Header.parse(buf[0..12]);
+    const payload = h.payload(&buf);
+    try std.testing.expectEqual(@as(usize, 4), payload.len);
+    try std.testing.expectEqualStrings(&.{ 0x11, 0x22, 0x33, 0x44 }, payload);
+}
+
+test "RTP payload strips padding" {
+    // V=2, P=1, no extension, no CSRC
+    // 12-byte header + 4 payload bytes + 2 pad bytes (last byte = pad length)
+    var buf: [18]u8 = [_]u8{0} ** 18;
+    buf[0] = 0xA0; // V=2, P=1
+    buf[1] = 0x00;
+    buf[2] = 0x12;
+    buf[3] = 0x34;
+    buf[8] = 0x00;
+    buf[9] = 0x01;
+    buf[10] = 0x00;
+    buf[11] = 0x00;
+
+    buf[12] = 0x11;
+    buf[13] = 0x22;
+    buf[14] = 0x33;
+    buf[15] = 0x44;
+    buf[16] = 0x00;
+    buf[17] = 0x02; // pad length = 2
+
+    const h = try Header.parse(buf[0..12]);
+    const payload = h.payload(&buf);
+    try std.testing.expectEqual(@as(usize, 4), payload.len);
+    try std.testing.expectEqualStrings(&.{ 0x11, 0x22, 0x33, 0x44 }, payload);
 }

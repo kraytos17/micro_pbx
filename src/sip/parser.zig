@@ -3,6 +3,8 @@
 const std = @import("std");
 const msg = @import("message.zig");
 
+const log = std.log.scoped(.parser);
+
 pub fn parse(buf: []const u8) !msg.Message {
     const sep = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return error.MalformedStartLine;
     const header_section = buf[0..sep];
@@ -163,8 +165,8 @@ fn extractParam(value: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, value, ';');
     while (it.next()) |part| {
         const trimmed = std.mem.trim(u8, part, " ");
-        if (std.mem.startsWith(u8, trimmed, name)) {
-            const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse return null;
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        if (std.mem.eql(u8, trimmed[0..eq], name)) {
             return trimmed[eq + 1 ..];
         }
     }
@@ -428,4 +430,20 @@ test "parse response with To tag" {
     const resp = result.response;
 
     try std.testing.expectEqualStrings("toTag", resp.to_tag.?);
+}
+
+test "extractParam exact match" {
+    try std.testing.expectEqualStrings("abc", extractParam("tag=abc;tag2=xyz", "tag").?);
+    try std.testing.expectEqualStrings("xyz", extractParam("tag=abc;tag2=xyz", "tag2").?);
+    try std.testing.expectEqualStrings("z9hG4bK1", extractParam(";branch=z9hG4bK1;tag2=foo", "branch").?);
+}
+
+test "extractParam does not prefix-match" {
+    try std.testing.expect(extractParam("tag2=xyz", "tag") == null);
+    try std.testing.expect(extractParam("branchy=1", "branch") == null);
+}
+
+test "extractParam no-match and no-equals returns null" {
+    try std.testing.expect(extractParam("tag=abc", "branch") == null);
+    try std.testing.expect(extractParam("tagonly", "tag") == null);
 }

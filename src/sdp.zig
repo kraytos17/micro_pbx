@@ -2,6 +2,8 @@
 
 const std = @import("std");
 
+const log = std.log.scoped(.sdp);
+
 /// Minimal SDP media description extracted from a body.
 pub const MediaInfo = struct {
     ip_addr: []const u8,
@@ -84,26 +86,3 @@ test "parse SDP basic" {
     try std.testing.expectEqual(@as(u16, 8000), info.port);
     try std.testing.expectEqual(@as(u7, 0), info.payload_type);
 }
-
-// test "debug SDP" {
-//     const sdp =
-//         "v=0\r\n" ++
-//         "o=alice 123456 789 IN IP4 192.168.1.5\r\n" ++
-//         "s=Session\r\n" ++
-//         "c=IN IP4 192.168.1.5\r\n" ++
-//         "m=audio 8000 RTP/AVP 0\r\n";
-
-//     var lines = std.mem.splitScalar(u8, sdp, '\n');
-//     var count: usize = 0;
-//     while (lines.next()) |raw_line| {
-//         const line = std.mem.trim(u8, raw_line, "\r");
-//         std.debug.print("Line {}: '{s}' (len={})\n", .{ count, line, line.len });
-//         if (line.len >= 9 and std.mem.eql(u8, line[0..9], "c=IN IP4 ")) {
-//             std.debug.print("Found c line: '{s}'\n", .{line});
-//         }
-//         if (line.len >= 8 and std.mem.eql(u8, line[0..8], "m=audio ")) {
-//             std.debug.print("Found m line: '{s}'\n", .{line});
-//         }
-//         count += 1;
-//     }
-// }

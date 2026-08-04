@@ -2,6 +2,8 @@
 
 const std = @import("std");
 
+const log = std.log.scoped(.registrar);
+
 /// Returns the username portion of an AOR, or null if it lacks a `sip:` prefix.
 pub fn extractUsername(aor: []const u8) ?[]const u8 {
     const sip_prefix = "sip:";

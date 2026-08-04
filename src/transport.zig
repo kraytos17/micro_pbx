@@ -4,6 +4,8 @@ const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
 
+const log = std.log.scoped(.transport);
+
 /// Errors returned by UDP socket operations.
 pub const TransportError = error{
     SocketBindFailed,
@@ -38,7 +40,10 @@ pub const UdpSocket = struct {
     }
 
     pub fn sendTo(self: *UdpSocket, buf: []const u8, to: net.IpAddress) !void {
-        self.socket.send(self.io, &to, buf) catch return error.SendFailed;
+        self.socket.send(self.io, &to, buf) catch |err| switch (err) {
+            error.MessageOversize => return error.PacketTooLarge,
+            else => return error.SendFailed,
+        };
     }
 
     pub fn sendToPort(self: *UdpSocket, buf: []const u8, ip: net.IpAddress, port: u16) !void {

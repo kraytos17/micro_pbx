@@ -2,6 +2,8 @@
 
 const std = @import("std");
 
+const log = std.log.scoped(.message);
+
 /// SIP request methods supported by the PBX.
 pub const Method = enum {
     REGISTER,

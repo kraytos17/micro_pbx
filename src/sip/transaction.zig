@@ -5,6 +5,13 @@ const msg = @import("message.zig");
 const Io = std.Io;
 const net = std.Io.net;
 
+const log = std.log.scoped(.txn);
+
+/// Current wall-clock time in milliseconds since the epoch.
+fn nowMs(io: Io) i64 {
+    return std.Io.Timestamp.now(io, std.Io.Clock.real).toMilliseconds();
+}
+
 // RFC 3261 SIP Timer Values (in milliseconds)
 pub const t1_ms: u32 = 500; // RTT estimate
 pub const t2_ms: u32 = 4000; // Maximum retransmit interval
@@ -114,7 +121,7 @@ pub const TransactionLayer = struct {
         const request_owned = try self.allocator.dupe(u8, request_buf);
         errdefer self.allocator.free(request_owned);
 
-        const now_ms: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, 1000000));
+        const now_ms = nowMs(self.io);
         const txn_id: TransactionId = .{
             .branch = branch_owned,
             .method = .INVITE,
@@ -146,7 +153,7 @@ pub const TransactionLayer = struct {
         const request_owned = try self.allocator.dupe(u8, request_buf);
         errdefer self.allocator.free(request_owned);
 
-        const now_ms: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, 1000000));
+        const now_ms = nowMs(self.io);
         const txn_id: TransactionId = .{
             .branch = branch_owned,
             .method = method,
@@ -196,7 +203,7 @@ pub const TransactionLayer = struct {
 
         if (self.map.getPtr(id)) |entry| {
             entry.state = .completed;
-            const now_ms: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, 1000000));
+            const now_ms = nowMs(self.io);
             if (entry.txn_type == .invite) {
                 entry.next_fire_at_ms = now_ms + timer_d_ms;
             } else {
@@ -238,7 +245,7 @@ pub const TransactionLayer = struct {
         var it = self.map.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.state != .terminated) {
-                const timeout = entry.value_ptr.next_fire_at_ms - @as(i64, @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, 1000000)));
+                const timeout = entry.value_ptr.next_fire_at_ms - nowMs(self.io);
                 if (timeout < min_timeout) {
                     min_timeout = timeout;
                 }
@@ -252,7 +259,7 @@ pub const TransactionLayer = struct {
     pub fn tick(
         self: *TransactionLayer,
     ) ?struct { branch: []u8, method: msg.Method, data: []u8, addr: net.IpAddress } {
-        const now_ms: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, 1000000));
+        const now_ms = nowMs(self.io);
         var it = self.map.iterator();
         while (it.next()) |entry| {
             const txn = entry.value_ptr;

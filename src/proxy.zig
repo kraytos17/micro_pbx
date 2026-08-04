@@ -8,6 +8,8 @@ const sdp = @import("sdp.zig");
 const msg = @import("sip/message.zig");
 const transport = @import("transport.zig");
 
+const log = std.log.scoped(.proxy);
+
 /// Handles a MESSAGE request, forwarding it if the destination is registered.
 pub fn handleMessage(
     req: msg.Request,
@@ -164,11 +166,11 @@ pub fn handleResponse(
     try socket.sendTo(stripped, caller_addr);
 }
 
-/// Forwards an INVITE to the registered callee and returns the generated branch.
+/// Forwards an INVITE to the given contact and returns the generated branch.
 pub fn handleInvite(
     req: msg.Request,
     from_addr: std.Io.net.IpAddress,
-    registrar: *reg.Registrar,
+    contact: reg.Contact,
     socket: *transport.UdpSocket,
     pbx_addr: std.Io.net.IpAddress,
     resp_buf: []u8,
@@ -176,12 +178,6 @@ pub fn handleInvite(
     allocator: std.mem.Allocator,
     io: std.Io,
 ) !struct { branch: []u8, forwarded: []u8 } {
-    const dest_aor = extractUri(req.request_uri);
-    const contact = registrar.lookup(dest_aor) orelse {
-        try sendResponse(socket, from_addr, resp_buf, 404, "Not Found", req);
-        return error.NotFound;
-    };
-
     try sendResponse(socket, from_addr, resp_buf, 100, "Trying", req);
     const branch = try generateBranch(allocator, io);
 
@@ -324,7 +320,7 @@ fn buildForwardedRequest(
     var offset: usize = 0;
     offset += (std.fmt.bufPrint(buf[offset..], "{s} {s} SIP/2.0\r\n", .{ req.method.toSlice(), req.request_uri }) catch return error.BufferTooSmall).len;
 
-    const via_proto = if (pbx_addr.ip4.port != 0) "SIP/2.0/UDP" else "SIP/2.0/UDP";
+    const via_proto = "SIP/2.0/UDP";
     offset += (std.fmt.bufPrint(buf[offset..], "Via: {s} {d}.{d}.{d}.{d}:{d};branch={s}\r\n", .{ via_proto, pbx_addr.ip4.bytes[0], pbx_addr.ip4.bytes[1], pbx_addr.ip4.bytes[2], pbx_addr.ip4.bytes[3], pbx_addr.ip4.port, branch }) catch return error.BufferTooSmall).len;
 
     offset += (std.fmt.bufPrint(buf[offset..], "Via: {s}\r\n", .{req.via}) catch return error.BufferTooSmall).len;
@@ -354,7 +350,7 @@ fn buildOptionsRequest(req: msg.Request, dest_addr: std.Io.net.IpAddress, buf: [
     var offset: usize = 0;
     offset += (std.fmt.bufPrint(buf[offset..], "OPTIONS {s} SIP/2.0\r\n", .{req.request_uri}) catch return error.BufferTooSmall).len;
 
-    const via_proto = if (dest_addr.ip4.port != 0) "SIP/2.0/UDP" else "SIP/2.0/UDP";
+    const via_proto = "SIP/2.0/UDP";
     offset += (std.fmt.bufPrint(buf[offset..], "Via: {s} {d}.{d}.{d}.{d}:{d}\r\n", .{ via_proto, dest_addr.ip4.bytes[0], dest_addr.ip4.bytes[1], dest_addr.ip4.bytes[2], dest_addr.ip4.bytes[3], dest_addr.ip4.port }) catch return error.BufferTooSmall).len;
 
     offset += (std.fmt.bufPrint(buf[offset..], "From: {s}\r\n", .{req.from}) catch return error.BufferTooSmall).len;
