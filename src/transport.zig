@@ -1,13 +1,17 @@
+//! Thin wrapper around the std UDP socket for SIP/RTP I/O.
+
 const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
 
+/// Errors returned by UDP socket operations.
 pub const TransportError = error{
     SocketBindFailed,
     SendFailed,
     PacketTooLarge,
 };
 
+/// A bound UDP socket with receive/send helpers.
 pub const UdpSocket = struct {
     socket: net.Socket,
     io: Io,

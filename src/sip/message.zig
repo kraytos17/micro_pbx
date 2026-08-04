@@ -1,5 +1,8 @@
+//! SIP message model: method, request/response headers, and the parsed message union.
+
 const std = @import("std");
 
+/// SIP request methods supported by the PBX.
 pub const Method = enum {
     REGISTER,
     INVITE,
@@ -25,6 +28,7 @@ pub const Method = enum {
     }
 };
 
+/// Broad status-class bucket derived from a response code.
 pub const ResponseClass = enum {
     provisional,
     success,
@@ -45,6 +49,7 @@ pub const ResponseClass = enum {
     }
 };
 
+/// Parsed SIP request headers.
 pub const Request = struct {
     method: Method,
     request_uri: []const u8,
@@ -64,6 +69,7 @@ pub const Request = struct {
     body: []const u8,
 };
 
+/// Parsed SIP response headers.
 pub const Response = struct {
     status_code: u16,
     reason_phrase: []const u8,
@@ -80,28 +86,8 @@ pub const Response = struct {
     body: []const u8,
 };
 
+/// A parsed SIP message: either a request or a response.
 pub const Message = union(enum) {
     request: Request,
     response: Response,
-};
-
-pub const ParseError = error{
-    MalformedStartLine,
-    MissingMandatoryHeader,
-    InvalidCSeq,
-    UnknownMethod,
-    InvalidContentLength,
-    BodyTooShort,
-};
-
-pub const RegistrarError = error{
-    UserNotFound,
-    RegistrationExpired,
-    DuplicateCallId,
-};
-
-pub const TransportError = error{
-    SocketBindFailed,
-    SendFailed,
-    PacketTooLarge,
 };

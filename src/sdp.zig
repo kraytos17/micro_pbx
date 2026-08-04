@@ -1,11 +1,15 @@
+//! Minimal SDP parsing and rewriting for media negotiation.
+
 const std = @import("std");
 
+/// Minimal SDP media description extracted from a body.
 pub const MediaInfo = struct {
     ip_addr: []const u8,
     port: u16,
     payload_type: u7,
 };
 
+/// Parses an SDP body, extracting IP, port, and payload type.
 pub fn parseSdp(body: []const u8) !MediaInfo {
     var ip_addr: []const u8 = "";
     var port: u16 = 0;
@@ -33,7 +37,13 @@ pub fn parseSdp(body: []const u8) !MediaInfo {
     return .{ .ip_addr = ip_addr, .port = port, .payload_type = payload_type };
 }
 
-pub fn rewriteSdp(body: []const u8, new_ip: []const u8, new_port: u16, allocator: std.mem.Allocator) ![]u8 {
+/// Rewrites the connection IP and media port in an SDP body.
+pub fn rewriteSdp(
+    body: []const u8,
+    new_ip: []const u8,
+    new_port: u16,
+    allocator: std.mem.Allocator,
+) ![]u8 {
     var result = std.ArrayList(u8).initCapacity(allocator, 128) catch return error.OutOfMemory;
     errdefer result.deinit(allocator);
 

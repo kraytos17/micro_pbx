@@ -1,3 +1,5 @@
+//! Textual SIP message parsing into the message model.
+
 const std = @import("std");
 const msg = @import("message.zig");
 
@@ -17,7 +19,11 @@ pub fn parse(buf: []const u8) !msg.Message {
     }
 }
 
-fn parseRequest(start: []const u8, lines: *std.mem.SplitIterator(u8, .sequence), body: []const u8) !msg.Request {
+fn parseRequest(
+    start: []const u8,
+    lines: *std.mem.SplitIterator(u8, .sequence),
+    body: []const u8,
+) !msg.Request {
     var tokens = std.mem.splitScalar(u8, start, ' ');
     const method_str = tokens.next() orelse return error.MalformedStartLine;
     const uri = tokens.next() orelse return error.MalformedStartLine;
@@ -49,7 +55,11 @@ fn parseRequest(start: []const u8, lines: *std.mem.SplitIterator(u8, .sequence),
     return req;
 }
 
-fn parseResponse(start: []const u8, lines: *std.mem.SplitIterator(u8, .sequence), body: []const u8) !msg.Response {
+fn parseResponse(
+    start: []const u8,
+    lines: *std.mem.SplitIterator(u8, .sequence),
+    body: []const u8,
+) !msg.Response {
     var tokens = std.mem.splitScalar(u8, start, ' ');
     const version = tokens.next() orelse return error.MalformedStartLine;
     const status_str = tokens.next() orelse return error.MalformedStartLine;

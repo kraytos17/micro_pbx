@@ -1,7 +1,10 @@
+//! RTP header parsing and media session management for media relay.
+
 const std = @import("std");
 const net = std.Io.net;
 const transport = @import("transport.zig");
 
+/// Parsed RTP packet header.
 pub const Header = packed struct {
     csrc_count: u4,
     extension: u1,
@@ -44,6 +47,7 @@ pub const Header = packed struct {
     }
 };
 
+/// One active media leg, keyed by SIP Call-ID.
 pub const Session = struct {
     call_id: []u8,
     caller_rtp_port: u16,
@@ -54,12 +58,13 @@ pub const Session = struct {
     callee_payload_type: u7,
 };
 
-pub const Manager = struct {
+/// Allocates and tracks RTP sessions and their relay ports.
+pub const Sessions = struct {
     sessions: std.StringHashMap(Session),
     next_port: u16,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) Manager {
+    pub fn init(allocator: std.mem.Allocator) Sessions {
         return .{
             .sessions = std.StringHashMap(Session).init(allocator),
             .next_port = 10000,
@@ -67,7 +72,7 @@ pub const Manager = struct {
         };
     }
 
-    pub fn deinit(self: *Manager) void {
+    pub fn deinit(self: *Sessions) void {
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -75,7 +80,13 @@ pub const Manager = struct {
         self.sessions.deinit();
     }
 
-    pub fn createSession(self: *Manager, call_id: []const u8, caller_port: u16, caller_ip: net.IpAddress, caller_pt: u7) !Session {
+    pub fn createSession(
+        self: *Sessions,
+        call_id: []const u8,
+        caller_port: u16,
+        caller_ip: net.IpAddress,
+        caller_pt: u7,
+    ) !Session {
         if (self.next_port > 60000) self.next_port = 10000;
         const callee_port = self.next_port;
         self.next_port += 2;
@@ -97,20 +108,26 @@ pub const Manager = struct {
         return session;
     }
 
-    pub fn getSession(self: *Manager, call_id: []const u8) ?*Session {
+    pub fn getSession(self: *Sessions, call_id: []const u8) ?*Session {
         return self.sessions.getPtr(call_id);
     }
 
-    pub fn removeSession(self: *Manager, call_id: []const u8) void {
+    pub fn removeSession(self: *Sessions, call_id: []const u8) void {
         if (self.sessions.fetchRemove(call_id)) |kv| {
             self.allocator.free(kv.key);
         }
     }
 };
 
-pub fn handleRtpPacket(packet: []const u8, from_addr: net.IpAddress, manager: *Manager, sip_socket: *transport.UdpSocket) !void {
+/// Forwards an RTP packet between the two parties of a matching session.
+pub fn handleRtpPacket(
+    packet: []const u8,
+    from_addr: net.IpAddress,
+    sessions: *Sessions,
+    sip_socket: *transport.UdpSocket,
+) !void {
     _ = try Header.parse(packet);
-    var it = manager.sessions.iterator();
+    var it = sessions.sessions.iterator();
     while (it.next()) |entry| {
         const session = entry.value_ptr;
         if (from_addr.ip4.port == session.caller_rtp_port) {

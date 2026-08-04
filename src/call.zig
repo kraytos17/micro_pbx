@@ -1,6 +1,9 @@
+//! Call state machine and in-memory call context storage.
+
 const std = @import("std");
 const testing = std.testing;
 
+/// Lifecycle phases a SIP dialog moves through.
 pub const CallState = enum {
     proceeding,
     ringing,
@@ -10,6 +13,7 @@ pub const CallState = enum {
     terminated,
 };
 
+/// Per-dialog context used to route ACK/BYE/CANCEL between caller and callee.
 pub const Call = struct {
     state: CallState = .proceeding,
     caller_addr: std.Io.net.IpAddress,
@@ -18,14 +22,23 @@ pub const Call = struct {
     invite_branch: ?[]const u8 = null,
 };
 
-pub fn removeCall(calls: *std.StringHashMap(Call), allocator: std.mem.Allocator, call_id: []const u8) void {
+pub fn removeCall(
+    calls: *std.StringHashMap(Call),
+    allocator: std.mem.Allocator,
+    call_id: []const u8,
+) void {
     if (calls.fetchRemove(call_id)) |kv| {
         allocator.free(kv.key);
         if (kv.value.invite_branch) |b| allocator.free(b);
     }
 }
 
-pub fn putCall(calls: *std.StringHashMap(Call), allocator: std.mem.Allocator, call_id: []const u8, call: Call) !void {
+pub fn putCall(
+    calls: *std.StringHashMap(Call),
+    allocator: std.mem.Allocator,
+    call_id: []const u8,
+    call: Call,
+) !void {
     const key = try allocator.dupe(u8, call_id);
     errdefer allocator.free(key);
 

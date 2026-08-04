@@ -1,3 +1,5 @@
+//! PBX entry point: UDP event loop dispatching SIP requests and responses.
+
 const std = @import("std");
 const transport = @import("transport.zig");
 const sip = @import("sip/message.zig");
@@ -33,8 +35,8 @@ pub fn main(init: std.process.Init) !void {
         calls.deinit();
     }
 
-    var rtp_manager = rtp.Manager.init(alloc);
-    defer rtp_manager.deinit();
+    var rtp_sessions = rtp.Sessions.init(alloc);
+    defer rtp_sessions.deinit();
 
     var rtp_sockets = std.ArrayList(transport.UdpSocket).initCapacity(alloc, 32) catch unreachable;
     defer {
@@ -54,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
     while (true) {
         for (rtp_sockets.items) |*rtp_sock| {
             const result = rtp_sock.recvFrom(&rtp_buf) catch continue;
-            rtp.handleRtpPacket(result.data, result.from, &rtp_manager, &socket) catch continue;
+            rtp.handleRtpPacket(result.data, result.from, &rtp_sessions, &socket) catch continue;
         }
 
         const result = socket.recvFrom(&recv_buf) catch |err| {
@@ -101,18 +103,18 @@ pub fn main(init: std.process.Init) !void {
                                 // Generate branch for 404 response (RFC 3261)
                                 const branch_404 = try proxy.generateBranch(alloc, io);
                                 defer alloc.free(branch_404);
-                                
+
                                 // Build 404 response
                                 var response_buf: [2048]u8 = undefined;
                                 const response_404 = try proxy.buildResponse(&response_buf, 404, "Not Found", req, branch_404);
-                                
+
                                 // Send the 404
                                 try proxy.sendResponseWithBranch(&socket, result.from, &resp_buf, 404, "Not Found", req, branch_404);
-                                
+
                                 // Cache the 404 response for retransmissions using client's branch
                                 try txn_layer.createNonInviteTransaction(req.via_branch, .INVITE, response_404, result.from);
                                 try txn_layer.storeResponse(req.via_branch, .INVITE, response_404);
-                                
+
                                 continue;
                             };
 
@@ -146,7 +148,7 @@ pub fn main(init: std.process.Init) !void {
                                 std.log.err("handleAck error: {}", .{err});
                             };
 
-                            if (rtp_manager.getSession(req.call_id)) |session| {
+                            if (rtp_sessions.getSession(req.call_id)) |session| {
                                 const caller_socket = try transport.UdpSocket.init(io, session.caller_rtp_port);
                                 try rtp_sockets.append(alloc, caller_socket);
                                 const callee_socket = try transport.UdpSocket.init(io, session.callee_rtp_port);
@@ -176,7 +178,7 @@ pub fn main(init: std.process.Init) !void {
                                 std.log.err("handleBye error: {}", .{err});
                             };
                             call.removeCall(&calls, alloc, req.call_id);
-                            rtp_manager.removeSession(req.call_id);
+                            rtp_sessions.removeSession(req.call_id);
                         } else {
                             proxy.sendResponse(&socket, result.from, &resp_buf, 481, "Call Leg Does Not Exist", req) catch {};
                         }
@@ -227,7 +229,7 @@ pub fn main(init: std.process.Init) !void {
                             if (call_ctx.state == .proceeding or call_ctx.state == .ringing) {
                                 call_ctx.state = .ringing;
                                 call_ctx.callee_resp_addr = result.from;
-                                proxy.handleResponse(resp, dest_addr, &socket, result.data, &rtp_manager, alloc, &fwd_buf) catch |err| {
+                                proxy.handleResponse(resp, dest_addr, &socket, result.data, &rtp_sessions, alloc, &fwd_buf) catch |err| {
                                     std.log.err("handleResponse 1xx: {}", .{err});
                                 };
                             }
@@ -237,18 +239,18 @@ pub fn main(init: std.process.Init) !void {
                                 if (call_ctx.state == .proceeding or call_ctx.state == .ringing) {
                                     call_ctx.state = .answered;
                                     call_ctx.callee_resp_addr = result.from;
-                                    proxy.handleResponse(resp, dest_addr, &socket, result.data, &rtp_manager, alloc, &fwd_buf) catch |err| {
+                                    proxy.handleResponse(resp, dest_addr, &socket, result.data, &rtp_sessions, alloc, &fwd_buf) catch |err| {
                                         std.log.err("handleResponse 2xx: {}", .{err});
                                     };
                                 } else if (call_ctx.state == .canceling) {
                                     call_ctx.state = .answered;
                                     call_ctx.callee_resp_addr = result.from;
-                                    proxy.handleResponse(resp, dest_addr, &socket, result.data, &rtp_manager, alloc, &fwd_buf) catch |err| {
+                                    proxy.handleResponse(resp, dest_addr, &socket, result.data, &rtp_sessions, alloc, &fwd_buf) catch |err| {
                                         std.log.err("handleResponse 2xx race: {}", .{err});
                                     };
                                 }
                             } else {
-                                proxy.handleResponse(resp, dest_addr, &socket, result.data, &rtp_manager, alloc, &fwd_buf) catch |err| {
+                                proxy.handleResponse(resp, dest_addr, &socket, result.data, &rtp_sessions, alloc, &fwd_buf) catch |err| {
                                     std.log.err("handleResponse non-invite: {}", .{err});
                                 };
                             }
@@ -256,7 +258,7 @@ pub fn main(init: std.process.Init) !void {
                         487 => {
                             if (call_ctx.state == .canceling) {
                                 call_ctx.state = .terminated;
-                                proxy.handleResponse(resp, dest_addr, &socket, result.data, &rtp_manager, alloc, &fwd_buf) catch |err| {
+                                proxy.handleResponse(resp, dest_addr, &socket, result.data, &rtp_sessions, alloc, &fwd_buf) catch |err| {
                                     std.log.err("handleResponse 487: {}", .{err});
                                 };
                                 call.removeCall(&calls, alloc, resp.call_id);
@@ -265,7 +267,7 @@ pub fn main(init: std.process.Init) !void {
                         else => {
                             if (call_ctx.state != .terminated) {
                                 call_ctx.state = .terminated;
-                                proxy.handleResponse(resp, dest_addr, &socket, result.data, &rtp_manager, alloc, &fwd_buf) catch |err| {
+                                proxy.handleResponse(resp, dest_addr, &socket, result.data, &rtp_sessions, alloc, &fwd_buf) catch |err| {
                                     std.log.err("handleResponse final: {}", .{err});
                                 };
                                 call.removeCall(&calls, alloc, resp.call_id);
@@ -273,7 +275,7 @@ pub fn main(init: std.process.Init) !void {
                         },
                     }
                 } else {
-                    proxy.handleResponse(resp, dest_addr, &socket, result.data, &rtp_manager, alloc, &fwd_buf) catch |err| {
+                    proxy.handleResponse(resp, dest_addr, &socket, result.data, &rtp_sessions, alloc, &fwd_buf) catch |err| {
                         std.log.err("handleResponse no-ctx: {}", .{err});
                     };
                 }

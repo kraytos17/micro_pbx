@@ -1,5 +1,8 @@
+//! User registration store with dual-key AOR lookup (username and username@domain).
+
 const std = @import("std");
 
+/// Returns the username portion of an AOR, or null if it lacks a `sip:` prefix.
 pub fn extractUsername(aor: []const u8) ?[]const u8 {
     const sip_prefix = "sip:";
     if (!std.mem.startsWith(u8, aor, sip_prefix)) {
@@ -20,6 +23,7 @@ pub const Contact = struct {
     cseq: u32,
 };
 
+/// In-memory registration store keyed by AOR.
 pub const Registrar = struct {
     map: std.StringHashMap(Contact),
     allocator: std.mem.Allocator,
@@ -42,7 +46,15 @@ pub const Registrar = struct {
         self.map.deinit();
     }
 
-    pub fn register(self: *Registrar, aor: []const u8, contact: std.Io.net.IpAddress, expires: u32, call_id: []const u8, cseq: u32) !void {
+    /// Registers (or refreshes) a contact under the AOR and its username-only key.
+    pub fn register(
+        self: *Registrar,
+        aor: []const u8,
+        contact: std.Io.net.IpAddress,
+        expires: u32,
+        call_id: []const u8,
+        cseq: u32,
+    ) !void {
         const now = std.Io.Timestamp.now(self.io, std.Io.Clock.real).toSeconds();
         const expires_at = now + @as(i64, expires);
         if (self.map.getPtr(aor)) |entry| {
@@ -91,6 +103,7 @@ pub const Registrar = struct {
         }
     }
 
+    /// Looks up a contact by exact AOR, falling back to username-only match.
     pub fn lookup(self: *Registrar, aor: []const u8) ?Contact {
         const now = std.Io.Timestamp.now(self.io, std.Io.Clock.real).toSeconds();
         if (self.map.get(aor)) |entry| {

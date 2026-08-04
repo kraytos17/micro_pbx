@@ -1,15 +1,18 @@
+//! SIP transaction layer: state tracking, retransmission, and response caching.
+
 const std = @import("std");
 const msg = @import("message.zig");
 const Io = std.Io;
 const net = std.Io.net;
 
 // RFC 3261 SIP Timer Values (in milliseconds)
-pub const T1_MS: u32 = 500; // RTT estimate
-pub const T2_MS: u32 = 4000; // Maximum retransmit interval
-pub const TIMER_B_MS: u32 = 32000; // INVITE client timeout
-pub const TIMER_F_MS: u32 = 32000; // Non-INVITE client timeout
-pub const TIMER_D_MS: u32 = 32000; // Wait time for response retransmit
+pub const t1_ms: u32 = 500; // RTT estimate
+pub const t2_ms: u32 = 4000; // Maximum retransmit interval
+pub const timer_b_ms: u32 = 32000; // INVITE client timeout
+pub const timer_f_ms: u32 = 32000; // Non-INVITE client timeout
+pub const timer_d_ms: u32 = 32000; // Wait time for response retransmit
 
+/// Uniquely identifies a transaction by branch ID and method.
 pub const TransactionId = struct {
     branch: []const u8,
     method: msg.Method,
@@ -38,6 +41,7 @@ pub const TransactionIdContext = struct {
     }
 };
 
+/// Lifecycle phases of a SIP transaction.
 pub const TransactionState = enum {
     trying,
     proceeding,
@@ -45,12 +49,14 @@ pub const TransactionState = enum {
     terminated,
 };
 
+/// Distinguishes retransmission/cleanup rules for INVITE vs non-INVITE.
 pub const TransactionType = enum {
     invite,
     non_invite,
     cancelled,
 };
 
+/// Mutable per-transaction state: buffers, timers, and retransmission counters.
 pub const Transaction = struct {
     id: TransactionId,
     state: TransactionState,
@@ -65,6 +71,7 @@ pub const Transaction = struct {
     timer_f_fired: bool = false,
 };
 
+/// Drives timer-driven retransmission and response caching for all transactions.
 pub const TransactionLayer = struct {
     map: std.HashMap(TransactionId, Transaction, TransactionIdContext, 80),
     allocator: std.mem.Allocator,
@@ -94,6 +101,7 @@ pub const TransactionLayer = struct {
         return self.map.contains(id);
     }
 
+    /// Creates an INVITE transaction for retransmission tracking.
     pub fn createInviteTransaction(
         self: *TransactionLayer,
         branch: []const u8,
@@ -120,8 +128,8 @@ pub const TransactionLayer = struct {
             .response_buf = null,
             .remote_addr = remote_addr,
             .retransmit_count = 0,
-            .next_fire_at_ms = now_ms + T1_MS,
-            .t1_ms = T1_MS,
+            .next_fire_at_ms = now_ms + t1_ms,
+            .t1_ms = t1_ms,
         });
     }
 
@@ -152,11 +160,12 @@ pub const TransactionLayer = struct {
             .response_buf = null,
             .remote_addr = remote_addr,
             .retransmit_count = 0,
-            .next_fire_at_ms = now_ms + T1_MS,
-            .t1_ms = T1_MS,
+            .next_fire_at_ms = now_ms + t1_ms,
+            .t1_ms = t1_ms,
         });
     }
 
+    /// Caches a response on an existing transaction for retransmission replies.
     pub fn storeResponse(
         self: *TransactionLayer,
         branch: []const u8,
@@ -189,9 +198,9 @@ pub const TransactionLayer = struct {
             entry.state = .completed;
             const now_ms: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, 1000000));
             if (entry.txn_type == .invite) {
-                entry.next_fire_at_ms = now_ms + TIMER_D_MS;
+                entry.next_fire_at_ms = now_ms + timer_d_ms;
             } else {
-                entry.next_fire_at_ms = now_ms + TIMER_D_MS;
+                entry.next_fire_at_ms = now_ms + timer_d_ms;
             }
         }
     }
@@ -211,7 +220,11 @@ pub const TransactionLayer = struct {
         }
     }
 
-    pub fn getTransaction(self: *TransactionLayer, branch: []const u8, method: msg.Method) ?*Transaction {
+    pub fn getTransaction(
+        self: *TransactionLayer,
+        branch: []const u8,
+        method: msg.Method,
+    ) ?*Transaction {
         const id: TransactionId = .{
             .branch = branch,
             .method = method,
@@ -219,8 +232,9 @@ pub const TransactionLayer = struct {
         return self.map.getPtr(id);
     }
 
+    /// Returns the time (ms) until the earliest pending transaction timeout.
     pub fn nextTimeout(self: *TransactionLayer) i64 {
-        var min_timeout: i64 = TIMER_D_MS;
+        var min_timeout: i64 = timer_d_ms;
         var it = self.map.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.state != .terminated) {
@@ -234,7 +248,10 @@ pub const TransactionLayer = struct {
         return min_timeout;
     }
 
-    pub fn tick(self: *TransactionLayer) ?struct { branch: []u8, method: msg.Method, data: []u8, addr: net.IpAddress } {
+    /// Advances timers; returns the next request to retransmit, if any.
+    pub fn tick(
+        self: *TransactionLayer,
+    ) ?struct { branch: []u8, method: msg.Method, data: []u8, addr: net.IpAddress } {
         const now_ms: i64 = @intCast(@divTrunc(std.Io.Clock.real.now(self.io).nanoseconds, 1000000));
         var it = self.map.iterator();
         while (it.next()) |entry| {
@@ -268,7 +285,7 @@ pub const TransactionLayer = struct {
                 }
                 entry.value_ptr.retransmit_count += 1;
 
-                const new_t1 = @min(txn.t1_ms * 2, T2_MS);
+                const new_t1 = @min(txn.t1_ms * 2, t2_ms);
                 entry.value_ptr.t1_ms = new_t1;
                 entry.value_ptr.next_fire_at_ms = now_ms + new_t1;
 
