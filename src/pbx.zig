@@ -294,11 +294,13 @@ pub const Pbx = struct {
                 log.info("call {s} canceling", .{req.call_id});
                 const callee = call_ctx.callee_contact_addr orelse {
                     log.warn("CANCEL for call with no callee_contact_addr", .{});
+                    proxy.sendResponse(&self.socket, from, resp_buf, 481, "Call Leg Does Not Exist", req) catch {};
                     return;
                 };
 
                 const branch = call_ctx.invite_branch orelse {
                     log.warn("CANCEL for call with no stored invite_branch", .{});
+                    proxy.sendResponse(&self.socket, from, resp_buf, 481, "Call Leg Does Not Exist", req) catch {};
                     return;
                 };
 
@@ -323,18 +325,21 @@ pub const Pbx = struct {
         log.debug("SIP RESPONSE: {} {s}", .{ resp.status_code, resp.reason_phrase });
         const dest_addr = if (self.calls.get(resp.call_id)) |c| c.caller_addr else from;
         if (self.calls.getPtr(resp.call_id)) |call_ctx| {
-            switch (resp.status_code) {
-                100 => {},
-                101...199 => {
-                    if (call_ctx.state == .proceeding or call_ctx.state == .ringing) {
-                        call_ctx.state = .ringing;
-                        call_ctx.callee_resp_addr = from;
-                        proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
-                            log.err("handleResponse 1xx: {}", .{err});
-                        };
+            switch (msg.ResponseClass.of(resp.status_code)) {
+                .provisional => {
+                    if (resp.status_code == 100) {
+                        // The caller already received its own 100 Trying; do not relay.
+                    } else {
+                        if (call_ctx.state == .proceeding or call_ctx.state == .ringing) {
+                            call_ctx.state = .ringing;
+                            call_ctx.callee_resp_addr = from;
+                            proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
+                                log.err("handleResponse 1xx: {}", .{err});
+                            };
+                        }
                     }
                 },
-                200...299 => {
+                .success => {
                     if (resp.cseq_method == .INVITE) {
                         if (call_ctx.state == .proceeding or call_ctx.state == .ringing) {
                             call_ctx.state = .answered;
@@ -357,18 +362,15 @@ pub const Pbx = struct {
                         };
                     }
                 },
-                487 => {
-                    if (call_ctx.state == .canceling) {
+                .redirect, .client_error, .server_error, .global_error => {
+                    if (resp.status_code == 487 and call_ctx.state == .canceling) {
                         call_ctx.state = .terminated;
                         log.info("call {s} terminated (487)", .{resp.call_id});
                         proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
                             log.err("handleResponse 487: {}", .{err});
                         };
                         call.removeCall(&self.calls, self.allocator, resp.call_id);
-                    }
-                },
-                else => {
-                    if (call_ctx.state != .terminated) {
+                    } else if (call_ctx.state != .terminated) {
                         call_ctx.state = .terminated;
                         log.info("call {s} terminated ({d} {s})", .{ resp.call_id, resp.status_code, resp.reason_phrase });
                         proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
@@ -699,4 +701,65 @@ test "e2e RTP session created on INVITE with SDP, sockets opened on ACK" {
         "\r\n");
     try server.onBye(bye_req, test_alice_addr, &fwd_buf);
     try std.testing.expect(server.rtp_sessions.getSession(call_id) == null);
+}
+
+test "e2e duplicate REGISTER retransmission replays 200 OK" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var raw_buf: [512]u8 = undefined;
+    const raw = std.fmt.bufPrint(&raw_buf, "REGISTER sip:dup@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKdup\r\n" ++
+        "From: <sip:dup@127.0.0.1:5060>;tag=tagdup\r\n" ++
+        "To: <sip:dup@127.0.0.1:5060>\r\n" ++
+        "Call-ID: dupreg@127.0.0.1\r\n" ++
+        "CSeq: 5 REGISTER\r\n" ++
+        "Contact: <sip:dup@127.0.0.1>\r\n" ++
+        "Expires: 3600\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", .{}) catch unreachable;
+    const req = try parseRequest(raw);
+    try server.onRegister(req, test_alice_addr, &resp_buf);
+    try std.testing.expect(server.reg.lookup("sip:dup") != null);
+
+    // Retransmission with a lower CSeq (same Call-ID) must not error
+    var raw2_buf: [512]u8 = undefined;
+    const raw2 = std.fmt.bufPrint(&raw2_buf, "REGISTER sip:dup@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKdup2\r\n" ++
+        "From: <sip:dup@127.0.0.1:5060>;tag=tagdup\r\n" ++
+        "To: <sip:dup@127.0.0.1:5060>\r\n" ++
+        "Call-ID: dupreg@127.0.0.1\r\n" ++
+        "CSeq: 3 REGISTER\r\n" ++
+        "Contact: <sip:dup@127.0.0.1>\r\n" ++
+        "Expires: 3600\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", .{}) catch unreachable;
+    const req2 = try parseRequest(raw2);
+    try server.onRegister(req2, test_alice_addr, &resp_buf);
+    try std.testing.expect(server.reg.lookup("sip:dup") != null);
+}
+
+test "e2e CANCEL with missing callee sends 481" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+
+    // Insert a call manually in proceeding state with no callee contact
+    const call_id = "call-nocallee";
+    try call.putCall(&server.calls, server.allocator, call_id, .{ .caller_addr = test_alice_addr });
+
+    const cancel_req = try parseRequest("CANCEL sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKcnocallee\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>\r\n" ++
+        "Call-ID: call-nocallee\r\n" ++
+        "CSeq: 1 CANCEL\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    // Must not error: the 481 is sent internally
+    try server.onCancel(cancel_req, test_alice_addr, &resp_buf, &fwd_buf);
 }

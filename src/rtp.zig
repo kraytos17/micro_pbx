@@ -132,13 +132,17 @@ pub fn handleRtpPacket(
     var it = sessions.sessions.iterator();
     while (it.next()) |entry| {
         const session = entry.value_ptr;
-        if (from_addr.ip4.port == session.caller_rtp_port) {
+        if (std.mem.eql(u8, &from_addr.ip4.bytes, &session.caller_ip.ip4.bytes) and
+            from_addr.ip4.port == session.caller_rtp_port)
+        {
             if (session.callee_ip.ip4.port != 0) {
                 log.debug("RTP: Forwarding from caller to callee: {} bytes", .{packet.len});
                 try sip_socket.sendToPort(packet, session.callee_ip, session.callee_rtp_port);
                 return;
             }
-        } else if (from_addr.ip4.port == session.callee_rtp_port) {
+        } else if (std.mem.eql(u8, &from_addr.ip4.bytes, &session.callee_ip.ip4.bytes) and
+            from_addr.ip4.port == session.callee_rtp_port)
+        {
             log.debug("RTP: Forwarding from callee to caller: {} bytes", .{packet.len});
             try sip_socket.sendToPort(packet, session.caller_ip, session.caller_rtp_port);
             return;
@@ -258,4 +262,45 @@ test "RTP payload strips padding" {
     const payload = h.payload(&buf);
     try std.testing.expectEqual(@as(usize, 4), payload.len);
     try std.testing.expectEqualStrings(&.{ 0x11, 0x22, 0x33, 0x44 }, payload);
+}
+
+test "RTP relay matches by IP and port, not port alone" {
+    var sessions = Sessions.init(std.testing.allocator);
+    defer sessions.deinit();
+
+    const caller_ip = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 10 }, .port = 5070 } };
+
+    _ = try sessions.createSession("call-1", 20000, caller_ip, 0);
+    const session = sessions.getSession("call-1").?;
+
+    // Destination socket that should receive the forwarded packet
+    var dest = try transport.UdpSocket.init(std.testing.io, 0);
+    defer dest.deinit();
+    const dest_addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address.loopback(dest.socket.address.ip4.port) };
+    session.callee_ip = dest_addr;
+    session.callee_rtp_port = dest_addr.ip4.port;
+
+    var relay = try transport.UdpSocket.init(std.testing.io, 0);
+    defer relay.deinit();
+
+    const packet = [_]u8{ 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03 };
+
+    // Matching (IP, port) forwards the packet
+    const matching_from = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 10 }, .port = 20000 } };
+    try handleRtpPacket(&packet, matching_from, &sessions, &relay);
+    var recv_buf: [64]u8 = undefined;
+    const received = try dest.recvFrom(&recv_buf);
+    try std.testing.expectEqual(@as(usize, 15), received.data.len);
+
+    // Same RTP port but different IP must NOT forward (cross-talk guard)
+    const wrong_ip = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 99 }, .port = 20000 } };
+    try handleRtpPacket(&packet, wrong_ip, &sessions, &relay);
+
+    // A matching packet forwarded now should arrive with no extra packet ahead
+    // of it: if wrong_ip had been forwarded, this receive would see that packet
+    // instead of the one we just sent.
+    try handleRtpPacket(&packet, matching_from, &sessions, &relay);
+    const second = try dest.recvFrom(&recv_buf);
+    try std.testing.expectEqual(@as(usize, 15), second.data.len);
+    try std.testing.expectEqualStrings(&packet, second.data);
 }

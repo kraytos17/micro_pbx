@@ -204,7 +204,12 @@ pub fn handleRegister(
     }
 
     const expires = req.expires orelse 3600;
-    try registrar.register(aor, from_addr, expires, req.call_id, req.cseq_num);
+    registrar.register(aor, from_addr, expires, req.call_id, req.cseq_num) catch |err| switch (err) {
+        // A stale or duplicated REGISTER retransmission is not an error: reply
+        // 200 OK per RFC 3261
+        error.DuplicateCallId => {},
+        else => return err,
+    };
     return try sendResponse(socket, from_addr, resp_buf, 200, "OK", req);
 }
 

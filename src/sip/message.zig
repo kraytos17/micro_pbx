@@ -93,3 +93,14 @@ pub const Message = union(enum) {
     request: Request,
     response: Response,
 };
+
+test "ResponseClass.of buckets every status code" {
+    try std.testing.expectEqual(ResponseClass.provisional, ResponseClass.of(100));
+    try std.testing.expectEqual(ResponseClass.provisional, ResponseClass.of(180));
+    try std.testing.expectEqual(ResponseClass.success, ResponseClass.of(200));
+    try std.testing.expectEqual(ResponseClass.redirect, ResponseClass.of(302));
+    try std.testing.expectEqual(ResponseClass.client_error, ResponseClass.of(404));
+    try std.testing.expectEqual(ResponseClass.client_error, ResponseClass.of(487));
+    try std.testing.expectEqual(ResponseClass.server_error, ResponseClass.of(500));
+    try std.testing.expectEqual(ResponseClass.global_error, ResponseClass.of(600));
+}
