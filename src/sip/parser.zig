@@ -1,12 +1,13 @@
 //! Textual SIP message parsing into the message model.
 
 const std = @import("std");
+
 const msg = @import("message.zig");
 
 const log = std.log.scoped(.parser);
 
 pub fn parse(buf: []const u8) !msg.Message {
-    const sep = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return error.MalformedStartLine;
+    const sep = std.mem.find(u8, buf, "\r\n\r\n") orelse return error.MalformedStartLine;
     const header_section = buf[0..sep];
     const body = if (sep + 4 < buf.len) buf[sep + 4 ..] else "";
 
@@ -71,7 +72,7 @@ fn parseResponse(
 
     const status_code = std.fmt.parseInt(u16, status_str, 10) catch return error.MalformedStartLine;
     const reason_start = status_str.len + 1 + version.len + 1;
-    const reason_end = std.mem.indexOf(u8, start, "\r\n") orelse start.len;
+    const reason_end = std.mem.find(u8, start, "\r\n") orelse start.len;
     const reason = std.mem.trim(u8, start[reason_start..reason_end], " ");
     var resp = msg.Response{
         .status_code = status_code,
@@ -97,7 +98,7 @@ fn parseRequestHeaders(out: *msg.Request, lines: *std.mem.SplitIterator(u8, .seq
     while (lines.next()) |line| {
         if (line.len == 0) break;
 
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const key = std.mem.trim(u8, line[0..colon], " ");
         const value = std.mem.trim(u8, line[colon + 1 ..], " ");
 
@@ -134,7 +135,7 @@ fn parseResponseHeaders(out: *msg.Response, lines: *std.mem.SplitIterator(u8, .s
     while (lines.next()) |line| {
         if (line.len == 0) break;
 
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const key = std.mem.trim(u8, line[0..colon], " ");
         const value = std.mem.trim(u8, line[colon + 1 ..], " ");
 
@@ -165,7 +166,7 @@ fn extractParam(value: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, value, ';');
     while (it.next()) |part| {
         const trimmed = std.mem.trim(u8, part, " ");
-        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, trimmed, '=') orelse continue;
         if (std.mem.eql(u8, trimmed[0..eq], name)) {
             return trimmed[eq + 1 ..];
         }

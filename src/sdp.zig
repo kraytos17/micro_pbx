@@ -58,7 +58,7 @@ pub fn rewriteSdp(
             try result.appendSlice(allocator, "\r\n");
         } else if (line.len > 8 and std.mem.eql(u8, line[0..8], "m=audio ")) {
             try result.appendSlice(allocator, "m=audio ");
-            const port_str = try std.fmt.allocPrint(allocator, "{d}", .{new_port});
+            const port_str = try allocator.print("{d}", .{new_port});
             defer allocator.free(port_str);
             try result.appendSlice(allocator, port_str);
             try result.appendSlice(allocator, " RTP/AVP ");

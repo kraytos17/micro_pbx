@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const net = std.Io.net;
+
 const transport = @import("transport.zig");
 
 const log = std.log.scoped(.rtp);
@@ -38,6 +39,7 @@ pub const Header = packed struct {
             header_len += 4 + (@as(usize, ext_words) * 4);
         }
         if (header_len > data.len) return "";
+
         var payload_data = data[header_len..];
         if (self.padding == 1 and payload_data.len > 0) {
             const pad_len = payload_data[payload_data.len - 1];
@@ -95,7 +97,6 @@ pub const Sessions = struct {
 
         const call_id_owned = try self.allocator.dupe(u8, call_id);
         errdefer self.allocator.free(call_id_owned);
-
         const session = Session{
             .call_id = call_id_owned,
             .caller_rtp_port = caller_port,
@@ -151,7 +152,7 @@ pub fn handleRtpPacket(
 }
 
 test "RTP header parse basic" {
-    var buf: [12]u8 = [_]u8{0} ** 12;
+    var buf: [12]u8 = @splat(0);
     buf[0] = 0x80;
     buf[1] = 0x00;
     buf[2] = 0x12;
@@ -175,7 +176,7 @@ test "RTP header parse basic" {
 test "RTP payload with extension header skips extension bytes" {
     // Version 2, X=1, no CSRC, PT=0
     // 12-byte header, then 4-byte ext header (ext len = 1 word), then 4 ext bytes, then 4 payload bytes
-    var buf: [20]u8 = [_]u8{0} ** 20;
+    var buf: [20]u8 = @splat(0);
     buf[0] = 0x90; // V=2, X=1
     buf[1] = 0x00;
     buf[2] = 0x12;
@@ -204,7 +205,7 @@ test "RTP payload with extension header skips extension bytes" {
 }
 
 test "RTP payload with extension returns trailing payload" {
-    var buf: [24]u8 = [_]u8{0} ** 24;
+    var buf: [24]u8 = @splat(0);
     buf[0] = 0x90; // V=2, X=1
     buf[1] = 0x00;
     buf[2] = 0x12;
@@ -241,7 +242,7 @@ test "RTP payload with extension returns trailing payload" {
 test "RTP payload strips padding" {
     // V=2, P=1, no extension, no CSRC
     // 12-byte header + 4 payload bytes + 2 pad bytes (last byte = pad length)
-    var buf: [18]u8 = [_]u8{0} ** 18;
+    var buf: [18]u8 = @splat(0);
     buf[0] = 0xA0; // V=2, P=1
     buf[1] = 0x00;
     buf[2] = 0x12;

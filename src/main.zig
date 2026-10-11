@@ -1,6 +1,7 @@
 //! PBX entry point: bootstrap and logging configuration.
 
 const std = @import("std");
+
 const pbx = @import("pbx.zig");
 
 const log = std.log.scoped(.main);
@@ -21,7 +22,6 @@ fn pbxLog(
 ) void {
     const io = std.Options.debug_io;
     const ts = std.Io.Timestamp.now(io, std.Io.Clock.real);
-
     const secs = ts.toSeconds();
     const ms: u64 = @intCast(@mod(ts.toMilliseconds(), 1000));
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(secs, 0)) };
@@ -37,6 +37,7 @@ fn pbxLog(
         .info => .green,
         .debug => .magenta,
     }) catch {};
+
     stderr.setColor(.bold) catch {};
     stderr.writer.print("[{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}] {s}", .{
         day_seconds.getHoursIntoDay(),
@@ -45,6 +46,7 @@ fn pbxLog(
         ms,
         level.asText(),
     }) catch return;
+
     stderr.setColor(.reset) catch {};
     stderr.setColor(.dim) catch {};
     stderr.setColor(.bold) catch {};
@@ -56,7 +58,7 @@ fn pbxLog(
 }
 
 pub fn main(init: std.process.Init) !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
 
     var server = try pbx.Pbx.init(gpa.allocator(), init.io, 5060);

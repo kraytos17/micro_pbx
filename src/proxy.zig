@@ -61,7 +61,6 @@ pub fn handleAck(
     const dest_aor = extractUri(req.request_uri);
     const contact = registrar.lookup(dest_aor);
     const actual_dest = if (contact) |c| c.address else dest_addr;
-
     const forwarded = try buildForwardedRequest(req, pbx_addr, branch, fwd_buf);
     try socket.sendTo(forwarded, actual_dest);
 }
@@ -78,7 +77,6 @@ pub fn handleBye(
     const dest_aor = extractUri(req.request_uri);
     const contact = registrar.lookup(dest_aor);
     const actual_dest = if (contact) |c| c.address else dest_addr;
-
     const forwarded = try buildForwardedRequest(req, pbx_addr, branch, fwd_buf);
     try socket.sendTo(forwarded, actual_dest);
 }
@@ -99,11 +97,11 @@ pub fn handleCancel(
 }
 
 fn stripTopVia(raw: []const u8, out: []u8) []u8 {
-    const via_start = std.mem.indexOf(u8, raw, "Via: ") orelse {
+    const via_start = std.mem.find(u8, raw, "Via: ") orelse {
         @memcpy(out[0..raw.len], raw);
         return out[0..raw.len];
     };
-    const line_end = std.mem.indexOfPos(u8, raw, via_start, "\r\n") orelse {
+    const line_end = std.mem.findPos(u8, raw, via_start, "\r\n") orelse {
         @memcpy(out[0..raw.len], raw);
         return out[0..raw.len];
     };
@@ -115,25 +113,27 @@ fn stripTopVia(raw: []const u8, out: []u8) []u8 {
     return out[0 .. raw.len - (via_line_end - via_start)];
 }
 
+/// Print into a fixed-buffer writer, mapping overflow to BufferTooSmall.
+fn emit(w: *std.Io.Writer, comptime format: []const u8, args: anytype) error{BufferTooSmall}!void {
+    w.print(format, args) catch return error.BufferTooSmall;
+}
+
 fn buildCancelRequest(
     req: msg.Request,
     pbx_addr: std.Io.net.IpAddress,
     invite_branch: []const u8,
     buf: []u8,
 ) ![]u8 {
-    var offset: usize = 0;
+    var w = std.Io.Writer.fixed(buf);
+    try emit(&w, "CANCEL {s} SIP/2.0\r\n", .{req.request_uri});
+    try emit(&w, "Via: SIP/2.0/UDP {d}.{d}.{d}.{d}:{d};branch={s}\r\n", .{ pbx_addr.ip4.bytes[0], pbx_addr.ip4.bytes[1], pbx_addr.ip4.bytes[2], pbx_addr.ip4.bytes[3], pbx_addr.ip4.port, invite_branch });
 
-    offset += (std.fmt.bufPrint(buf[offset..], "CANCEL {s} SIP/2.0\r\n", .{req.request_uri}) catch return error.BufferTooSmall).len;
-
-    offset += (std.fmt.bufPrint(buf[offset..], "Via: SIP/2.0/UDP {d}.{d}.{d}.{d}:{d};branch={s}\r\n", .{ pbx_addr.ip4.bytes[0], pbx_addr.ip4.bytes[1], pbx_addr.ip4.bytes[2], pbx_addr.ip4.bytes[3], pbx_addr.ip4.port, invite_branch }) catch return error.BufferTooSmall).len;
-
-    offset += (std.fmt.bufPrint(buf[offset..], "From: {s}\r\n", .{req.from}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "To: {s}\r\n", .{req.to}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "Call-ID: {s}\r\n", .{req.call_id}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "CSeq: {d} CANCEL\r\n", .{req.cseq_num}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "Content-Length: 0\r\n\r\n", .{}) catch return error.BufferTooSmall).len;
-
-    return buf[0..offset];
+    try emit(&w, "From: {s}\r\n", .{req.from});
+    try emit(&w, "To: {s}\r\n", .{req.to});
+    try emit(&w, "Call-ID: {s}\r\n", .{req.call_id});
+    try emit(&w, "CSeq: {d} CANCEL\r\n", .{req.cseq_num});
+    try emit(&w, "Content-Length: 0\r\n\r\n", .{});
+    return w.buffered();
 }
 
 pub fn handleResponse(
@@ -181,7 +181,6 @@ pub fn handleInvite(
 ) !struct { branch: []u8, forwarded: []u8 } {
     try sendResponse(socket, from_addr, resp_buf, 100, "Trying", req);
     const branch = try generateBranch(allocator, io);
-
     const forwarded = try buildForwardedRequest(req, pbx_addr, branch, fwd_buf);
     try socket.sendTo(forwarded, contact.address);
     return .{ .branch = branch, .forwarded = forwarded };
@@ -229,28 +228,46 @@ pub fn buildResponse(
     req: msg.Request,
     branch: ?[]const u8,
 ) ![]u8 {
-    var offset: usize = 0;
-    offset += (std.fmt.bufPrint(buf[offset..], "SIP/2.0 {d} {s}\r\n", .{ status, reason }) catch return error.BufferTooSmall).len;
-
+    var w = std.Io.Writer.fixed(buf);
+    try emit(&w, "SIP/2.0 {d} {s}\r\n", .{ status, reason });
     // Build Via header with branch
     if (branch) |b| {
-        offset += (std.fmt.bufPrint(buf[offset..], "Via: {s};branch={s}\r\n", .{ req.via, b }) catch return error.BufferTooSmall).len;
+        try emit(&w, "Via: {s};branch={s}\r\n", .{ req.via, b });
     } else {
-        offset += (std.fmt.bufPrint(buf[offset..], "Via: {s}\r\n", .{req.via}) catch return error.BufferTooSmall).len;
+        try emit(&w, "Via: {s}\r\n", .{req.via});
     }
 
-    offset += (std.fmt.bufPrint(buf[offset..], "From: {s}\r\n", .{req.from}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "To: {s}\r\n", .{req.to}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "Call-ID: {s}\r\n", .{req.call_id}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "CSeq: {d} {s}\r\n", .{ req.cseq_num, req.cseq_method.toSlice() }) catch return error.BufferTooSmall).len;
-
+    try emit(&w, "From: {s}\r\n", .{req.from});
+    try emit(&w, "To: {s}\r\n", .{req.to});
+    try emit(&w, "Call-ID: {s}\r\n", .{req.call_id});
+    try emit(&w, "CSeq: {d} {s}\r\n", .{ req.cseq_num, req.cseq_method.toSlice() });
     if (req.contact) |c| {
-        offset += (std.fmt.bufPrint(buf[offset..], "Contact: {s}\r\n", .{c}) catch return error.BufferTooSmall).len;
+        try emit(&w, "Contact: {s}\r\n", .{c});
     }
 
-    offset += (std.fmt.bufPrint(buf[offset..], "Content-Length: 0\r\n\r\n", .{}) catch return error.BufferTooSmall).len;
+    try emit(&w, "Content-Length: 0\r\n\r\n", .{});
+    return w.buffered();
+}
 
-    return buf[0..offset];
+/// Renders a 408 Request Timeout for a timed-out outbound INVITE.
+/// All header values must outlive the call; typically owned dupes.
+pub fn buildTimeoutResponse(
+    buf: []u8,
+    call_id: []const u8,
+    cseq_num: u32,
+    via: []const u8,
+    from: []const u8,
+    to: []const u8,
+) ![]u8 {
+    var w = std.Io.Writer.fixed(buf);
+    try emit(&w, "SIP/2.0 408 Request Timeout\r\n", .{});
+    try emit(&w, "Via: {s}\r\n", .{via});
+    try emit(&w, "From: {s}\r\n", .{from});
+    try emit(&w, "To: {s}\r\n", .{to});
+    try emit(&w, "Call-ID: {s}\r\n", .{call_id});
+    try emit(&w, "CSeq: {d} INVITE\r\n", .{cseq_num});
+    try emit(&w, "Content-Length: 0\r\n\r\n", .{});
+    return w.buffered();
 }
 
 pub fn sendResponse(
@@ -273,40 +290,25 @@ pub fn sendResponseWithBranch(
     req: msg.Request,
     branch: ?[]const u8,
 ) !void {
-    const response = std.fmt.bufPrint(buf, "SIP/2.0 {d} {s}\r\n", .{ status, reason }) catch return error.BufferTooSmall;
-
-    const via_start = response.len;
-    var via_line_len: usize = 0;
-
+    var w = std.Io.Writer.fixed(buf);
+    try emit(&w, "SIP/2.0 {d} {s}\r\n", .{ status, reason });
     // If we have a branch, add it to the Via header (RFC 3261 compliance)
     if (branch) |b| {
-        via_line_len = (std.fmt.bufPrint(buf[via_start..], "Via: {s};branch={s}\r\n", .{ req.via, b }) catch return error.BufferTooSmall).len;
+        try emit(&w, "Via: {s};branch={s}\r\n", .{ req.via, b });
     } else {
-        via_line_len = (std.fmt.bufPrint(buf[via_start..], "Via: {s}\r\n", .{req.via}) catch return error.BufferTooSmall).len;
+        try emit(&w, "Via: {s}\r\n", .{req.via});
     }
 
-    const from_start = via_start + via_line_len;
-    const from_line = std.fmt.bufPrint(buf[from_start..], "From: {s}\r\n", .{req.from}) catch return error.BufferTooSmall;
-
-    const to_start = from_start + from_line.len;
-    const to_line = std.fmt.bufPrint(buf[to_start..], "To: {s}\r\n", .{req.to}) catch return error.BufferTooSmall;
-    const call_start = to_start + to_line.len;
-    const call_line = std.fmt.bufPrint(buf[call_start..], "Call-ID: {s}\r\n", .{req.call_id}) catch return error.BufferTooSmall;
-
-    const cseq_start = call_start + call_line.len;
-    const cseq_line = std.fmt.bufPrint(buf[cseq_start..], "CSeq: {d} {s}\r\n", .{ req.cseq_num, req.cseq_method.toSlice() }) catch return error.BufferTooSmall;
-
-    const contact_start = cseq_start + cseq_line.len;
-    var content_start = contact_start;
+    try emit(&w, "From: {s}\r\n", .{req.from});
+    try emit(&w, "To: {s}\r\n", .{req.to});
+    try emit(&w, "Call-ID: {s}\r\n", .{req.call_id});
+    try emit(&w, "CSeq: {d} {s}\r\n", .{ req.cseq_num, req.cseq_method.toSlice() });
     if (req.contact) |c| {
-        const contact_line = std.fmt.bufPrint(buf[contact_start..], "Contact: {s}\r\n", .{c}) catch return error.BufferTooSmall;
-        content_start = contact_start + contact_line.len;
+        try emit(&w, "Contact: {s}\r\n", .{c});
     }
 
-    const content_len_line = std.fmt.bufPrint(buf[content_start..], "Content-Length: 0\r\n\r\n", .{}) catch return error.BufferTooSmall;
-
-    const total_len = content_start + content_len_line.len;
-    try socket.sendTo(buf[0..total_len], to);
+    try emit(&w, "Content-Length: 0\r\n\r\n", .{});
+    try socket.sendTo(w.buffered(), to);
 }
 
 /// Generates a random RFC 3261-style branch identifier.
@@ -314,7 +316,7 @@ pub fn generateBranch(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     var buf: [8]u8 = undefined;
     std.Io.random(io, &buf);
     const suffix = std.mem.readInt(u64, &buf, .little);
-    return std.fmt.allocPrint(allocator, "z9hG4bK{x}", .{suffix});
+    return allocator.print("z9hG4bK{x}", .{suffix});
 }
 
 fn buildForwardedRequest(
@@ -323,50 +325,48 @@ fn buildForwardedRequest(
     branch: []const u8,
     buf: []u8,
 ) ![]u8 {
-    var offset: usize = 0;
-    offset += (std.fmt.bufPrint(buf[offset..], "{s} {s} SIP/2.0\r\n", .{ req.method.toSlice(), req.request_uri }) catch return error.BufferTooSmall).len;
+    var w = std.Io.Writer.fixed(buf);
+    try emit(&w, "{s} {s} SIP/2.0\r\n", .{ req.method.toSlice(), req.request_uri });
 
     const via_proto = "SIP/2.0/UDP";
-    offset += (std.fmt.bufPrint(buf[offset..], "Via: {s} {d}.{d}.{d}.{d}:{d};branch={s}\r\n", .{ via_proto, pbx_addr.ip4.bytes[0], pbx_addr.ip4.bytes[1], pbx_addr.ip4.bytes[2], pbx_addr.ip4.bytes[3], pbx_addr.ip4.port, branch }) catch return error.BufferTooSmall).len;
+    try emit(&w, "Via: {s} {d}.{d}.{d}.{d}:{d};branch={s}\r\n", .{ via_proto, pbx_addr.ip4.bytes[0], pbx_addr.ip4.bytes[1], pbx_addr.ip4.bytes[2], pbx_addr.ip4.bytes[3], pbx_addr.ip4.port, branch });
 
-    offset += (std.fmt.bufPrint(buf[offset..], "Via: {s}\r\n", .{req.via}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "Max-Forwards: 70\r\n", .{}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "From: {s}\r\n", .{req.from}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "To: {s}\r\n", .{req.to}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "Call-ID: {s}\r\n", .{req.call_id}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "CSeq: {d} {s}\r\n", .{ req.cseq_num, req.cseq_method.toSlice() }) catch return error.BufferTooSmall).len;
-
+    try emit(&w, "Via: {s}\r\n", .{req.via});
+    try emit(&w, "Max-Forwards: 70\r\n", .{});
+    try emit(&w, "From: {s}\r\n", .{req.from});
+    try emit(&w, "To: {s}\r\n", .{req.to});
+    try emit(&w, "Call-ID: {s}\r\n", .{req.call_id});
+    try emit(&w, "CSeq: {d} {s}\r\n", .{ req.cseq_num, req.cseq_method.toSlice() });
     if (req.contact) |c| {
-        offset += (std.fmt.bufPrint(buf[offset..], "Contact: {s}\r\n", .{c}) catch return error.BufferTooSmall).len;
+        try emit(&w, "Contact: {s}\r\n", .{c});
     }
     if (req.content_type) |ct| {
-        offset += (std.fmt.bufPrint(buf[offset..], "Content-Type: {s}\r\n", .{ct}) catch return error.BufferTooSmall).len;
+        try emit(&w, "Content-Type: {s}\r\n", .{ct});
     }
 
-    offset += (std.fmt.bufPrint(buf[offset..], "Content-Length: {d}\r\n", .{req.body.len}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "\r\n", .{}) catch return error.BufferTooSmall).len;
+    try emit(&w, "Content-Length: {d}\r\n", .{req.body.len});
+    try emit(&w, "\r\n", .{});
     if (req.body.len > 0) {
-        @memcpy(buf[offset..][0..req.body.len], req.body);
-        offset += req.body.len;
+        w.writeAll(req.body) catch return error.BufferTooSmall;
     }
-    return buf[0..offset];
+    return w.buffered();
 }
 
 fn buildOptionsRequest(req: msg.Request, dest_addr: std.Io.net.IpAddress, buf: []u8) ![]u8 {
-    var offset: usize = 0;
-    offset += (std.fmt.bufPrint(buf[offset..], "OPTIONS {s} SIP/2.0\r\n", .{req.request_uri}) catch return error.BufferTooSmall).len;
+    var w = std.Io.Writer.fixed(buf);
+    try emit(&w, "OPTIONS {s} SIP/2.0\r\n", .{req.request_uri});
 
     const via_proto = "SIP/2.0/UDP";
-    offset += (std.fmt.bufPrint(buf[offset..], "Via: {s} {d}.{d}.{d}.{d}:{d}\r\n", .{ via_proto, dest_addr.ip4.bytes[0], dest_addr.ip4.bytes[1], dest_addr.ip4.bytes[2], dest_addr.ip4.bytes[3], dest_addr.ip4.port }) catch return error.BufferTooSmall).len;
+    try emit(&w, "Via: {s} {d}.{d}.{d}.{d}:{d}\r\n", .{ via_proto, dest_addr.ip4.bytes[0], dest_addr.ip4.bytes[1], dest_addr.ip4.bytes[2], dest_addr.ip4.bytes[3], dest_addr.ip4.port });
 
-    offset += (std.fmt.bufPrint(buf[offset..], "From: {s}\r\n", .{req.from}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "To: {s}\r\n", .{req.to}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "Call-ID: {s}\r\n", .{req.call_id}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "CSeq: {d} {s}\r\n", .{ req.cseq_num, req.cseq_method.toSlice() }) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, REGISTER, MESSAGE\r\n", .{}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "Content-Length: 0\r\n", .{}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "\r\n", .{}) catch return error.BufferTooSmall).len;
-    return buf[0..offset];
+    try emit(&w, "From: {s}\r\n", .{req.from});
+    try emit(&w, "To: {s}\r\n", .{req.to});
+    try emit(&w, "Call-ID: {s}\r\n", .{req.call_id});
+    try emit(&w, "CSeq: {d} {s}\r\n", .{ req.cseq_num, req.cseq_method.toSlice() });
+    try emit(&w, "Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, REGISTER, MESSAGE\r\n", .{});
+    try emit(&w, "Content-Length: 0\r\n", .{});
+    try emit(&w, "\r\n", .{});
+    return w.buffered();
 }
 
 fn buildResponseWithSdp(
@@ -375,36 +375,32 @@ fn buildResponseWithSdp(
     sdp_body: []const u8,
     include_via: bool,
 ) ![]u8 {
-    var offset: usize = 0;
-    offset += (std.fmt.bufPrint(buf[offset..], "SIP/2.0 {d} {s}\r\n", .{ resp.status_code, resp.reason_phrase }) catch return error.BufferTooSmall).len;
-
+    var w = std.Io.Writer.fixed(buf);
+    try emit(&w, "SIP/2.0 {d} {s}\r\n", .{ resp.status_code, resp.reason_phrase });
     if (include_via) {
-        offset += (std.fmt.bufPrint(buf[offset..], "Via: {s}\r\n", .{resp.via}) catch return error.BufferTooSmall).len;
+        try emit(&w, "Via: {s}\r\n", .{resp.via});
     }
 
-    offset += (std.fmt.bufPrint(buf[offset..], "From: {s}\r\n", .{resp.from}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "To: {s}", .{resp.to}) catch return error.BufferTooSmall).len;
+    try emit(&w, "From: {s}\r\n", .{resp.from});
+    try emit(&w, "To: {s}", .{resp.to});
     if (resp.to_tag) |tag| {
-        offset += (std.fmt.bufPrint(buf[offset..], ";tag={s}", .{tag}) catch return error.BufferTooSmall).len;
+        try emit(&w, ";tag={s}", .{tag});
     }
 
-    offset += (std.fmt.bufPrint(buf[offset..], "\r\n", .{}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "Call-ID: {s}\r\n", .{resp.call_id}) catch return error.BufferTooSmall).len;
-
-    offset += (std.fmt.bufPrint(buf[offset..], "CSeq: {d} {s}\r\n", .{ resp.cseq_num, resp.cseq_method.toSlice() }) catch return error.BufferTooSmall).len;
-
+    try emit(&w, "\r\n", .{});
+    try emit(&w, "Call-ID: {s}\r\n", .{resp.call_id});
+    try emit(&w, "CSeq: {d} {s}\r\n", .{ resp.cseq_num, resp.cseq_method.toSlice() });
     if (resp.contact) |c| {
-        offset += (std.fmt.bufPrint(buf[offset..], "Contact: {s}\r\n", .{c}) catch return error.BufferTooSmall).len;
+        try emit(&w, "Contact: {s}\r\n", .{c});
     }
 
-    offset += (std.fmt.bufPrint(buf[offset..], "Content-Type: application/sdp\r\n", .{}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "Content-Length: {d}\r\n", .{sdp_body.len}) catch return error.BufferTooSmall).len;
-    offset += (std.fmt.bufPrint(buf[offset..], "\r\n", .{}) catch return error.BufferTooSmall).len;
+    try emit(&w, "Content-Type: application/sdp\r\n", .{});
+    try emit(&w, "Content-Length: {d}\r\n", .{sdp_body.len});
+    try emit(&w, "\r\n", .{});
     if (sdp_body.len > 0) {
-        @memcpy(buf[offset..][0..sdp_body.len], sdp_body);
-        offset += sdp_body.len;
+        w.writeAll(sdp_body) catch return error.BufferTooSmall;
     }
-    return buf[0..offset];
+    return w.buffered();
 }
 
 test "extractUri with brackets" {
@@ -430,4 +426,27 @@ test "extractUri with IP address and port" {
 test "extractUri edge case - no angle brackets but has semicolon" {
     const result = extractUri("sip:alice@pbx.local;transport=udp");
     try std.testing.expectEqualStrings("sip:alice@pbx.local;transport=udp", result);
+}
+
+test "buildTimeoutResponse renders 408" {
+    var buf: [1024]u8 = undefined;
+    const out = try buildTimeoutResponse(
+        &buf,
+        "call-1",
+        1,
+        "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKabc",
+        "<sip:alice@127.0.0.1:5060>;tag=aliceTag",
+        "<sip:bob@127.0.0.1:5060>",
+    );
+    try std.testing.expectEqualStrings(
+        "SIP/2.0 408 Request Timeout\r\n" ++
+            "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKabc\r\n" ++
+            "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+            "To: <sip:bob@127.0.0.1:5060>\r\n" ++
+            "Call-ID: call-1\r\n" ++
+            "CSeq: 1 INVITE\r\n" ++
+            "Content-Length: 0\r\n" ++
+            "\r\n",
+        out,
+    );
 }

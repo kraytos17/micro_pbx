@@ -59,7 +59,9 @@ pub const Registrar = struct {
     ) !void {
         const now = std.Io.Timestamp.now(self.io, std.Io.Clock.real).toSeconds();
         const expires_at = now + @as(i64, expires);
-        if (self.map.getPtr(aor)) |entry| {
+        const gop = try self.map.getOrPut(aor);
+        if (gop.found_existing) {
+            const entry = gop.value_ptr;
             if (std.mem.eql(u8, entry.call_id, call_id) and cseq <= entry.cseq) {
                 return error.DuplicateCallId;
             }
@@ -70,37 +72,41 @@ pub const Registrar = struct {
             entry.expires_at = expires_at;
             entry.cseq = cseq;
         } else {
-            const key_owned = try self.allocator.dupe(u8, aor);
-            errdefer self.allocator.free(key_owned);
-            const call_id_owned = try self.allocator.dupe(u8, call_id);
-            errdefer self.allocator.free(call_id_owned);
-            try self.map.put(key_owned, .{
+            errdefer _ = self.map.remove(aor);
+            gop.key_ptr.* = try self.allocator.dupe(u8, aor);
+            errdefer self.allocator.free(gop.key_ptr.*);
+            gop.value_ptr.* = .{
                 .address = contact,
                 .expires_at = expires_at,
-                .call_id = call_id_owned,
+                .call_id = try self.allocator.dupe(u8, call_id),
                 .cseq = cseq,
-            });
+            };
         }
 
         if (extractUsername(aor)) |username| {
-            const username_key = try std.fmt.allocPrint(self.allocator, "sip:{s}", .{username});
-            if (self.map.getPtr(username_key)) |entry| {
+            const username_key = try self.allocator.print("sip:{s}", .{username});
+            const ugop = try self.map.getOrPut(username_key);
+            if (ugop.found_existing) {
                 self.allocator.free(username_key);
+                const entry = ugop.value_ptr;
                 self.allocator.free(entry.call_id);
                 entry.call_id = try self.allocator.dupe(u8, call_id);
                 entry.address = contact;
                 entry.expires_at = expires_at;
                 entry.cseq = cseq;
             } else {
-                const call_id_owned = try self.allocator.dupe(u8, call_id);
-                errdefer self.allocator.free(call_id_owned);
-                errdefer self.allocator.free(username_key);
-                try self.map.put(username_key, .{
+                errdefer {
+                    _ = self.map.remove(username_key);
+                    self.allocator.free(username_key);
+                }
+
+                ugop.key_ptr.* = username_key;
+                ugop.value_ptr.* = .{
                     .address = contact,
                     .expires_at = expires_at,
-                    .call_id = call_id_owned,
+                    .call_id = try self.allocator.dupe(u8, call_id),
                     .cseq = cseq,
-                });
+                };
             }
         }
     }
@@ -119,7 +125,7 @@ pub const Registrar = struct {
             return entry;
         }
         if (extractUsername(aor)) |username| {
-            const username_key = std.fmt.allocPrint(self.allocator, "sip:{s}", .{username}) catch return null;
+            const username_key = self.allocator.print("sip:{s}", .{username}) catch return null;
             defer self.allocator.free(username_key);
 
             if (self.map.get(username_key)) |entry| {
@@ -142,7 +148,7 @@ pub const Registrar = struct {
             self.allocator.free(kv.value.call_id);
         }
         if (extractUsername(aor)) |username| {
-            const username_key = std.fmt.allocPrint(self.allocator, "sip:{s}", .{username}) catch return;
+            const username_key = self.allocator.print("sip:{s}", .{username}) catch return;
             defer self.allocator.free(username_key);
             if (self.map.fetchRemove(username_key)) |kv| {
                 self.allocator.free(kv.key);

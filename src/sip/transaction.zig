@@ -1,9 +1,10 @@
 //! SIP transaction layer: state tracking, retransmission, and response caching.
 
 const std = @import("std");
-const msg = @import("message.zig");
 const Io = std.Io;
 const net = std.Io.net;
+
+const msg = @import("message.zig");
 
 const log = std.log.scoped(.txn);
 
@@ -76,6 +77,23 @@ pub const Transaction = struct {
     t1_ms: u32 = 500,
     timer_b_fired: bool = false,
     timer_f_fired: bool = false,
+};
+
+/// A single firing timer: the request bytes to resend and where to send them.
+/// Slices borrow map memory; resend before any mutation or removal.
+pub const Retransmission = struct {
+    branch: []const u8,
+    method: msg.Method,
+    data: []u8,
+    addr: net.IpAddress,
+};
+
+/// One timer event from tick(): either a request to retransmit or an
+/// expired (Timer B/F) transaction. Payloads borrow map memory; act on
+/// them before any mutation or removal (same discipline as Retransmission).
+pub const TickEvent = union(enum) {
+    retransmit: Retransmission,
+    expired: TransactionId,
 };
 
 /// Drives timer-driven retransmission and response caching for all transactions.
@@ -221,7 +239,6 @@ pub const TransactionLayer = struct {
             .branch = branch,
             .method = method,
         };
-
         if (self.map.getPtr(id)) |entry| {
             entry.state = .terminated;
         }
@@ -255,10 +272,10 @@ pub const TransactionLayer = struct {
         return min_timeout;
     }
 
-    /// Advances timers; returns the next request to retransmit, if any.
+    /// Advances timers; returns the next timer event, if any.
     pub fn tick(
         self: *TransactionLayer,
-    ) ?struct { branch: []u8, method: msg.Method, data: []u8, addr: net.IpAddress } {
+    ) ?TickEvent {
         const now_ms = nowMs(self.io);
         var it = self.map.iterator();
         while (it.next()) |entry| {
@@ -281,33 +298,35 @@ pub const TransactionLayer = struct {
             if (now_ms >= txn.next_fire_at_ms) {
                 if (txn.txn_type == .invite) {
                     if (txn.timer_b_fired) {
+                        const id = entry.key_ptr.*;
                         entry.value_ptr.state = .terminated;
-                        return null;
+                        return .{ .expired = id };
                     }
                 } else {
                     if (txn.timer_f_fired) {
+                        const id = entry.key_ptr.*;
                         entry.value_ptr.state = .terminated;
-                        return null;
+                        return .{ .expired = id };
                     }
                 }
-                entry.value_ptr.retransmit_count += 1;
 
+                entry.value_ptr.retransmit_count += 1;
                 const new_t1 = @min(txn.t1_ms * 2, t2_ms);
+
                 entry.value_ptr.t1_ms = new_t1;
                 entry.value_ptr.next_fire_at_ms = now_ms + new_t1;
-
                 if (txn.txn_type == .invite and txn.retransmit_count >= 64) {
                     entry.value_ptr.timer_b_fired = true;
                 } else if (txn.txn_type == .non_invite and txn.retransmit_count >= 64) {
                     entry.value_ptr.timer_f_fired = true;
                 }
 
-                return .{
+                return .{ .retransmit = .{
                     .branch = entry.key_ptr.branch,
                     .method = txn.id.method,
                     .data = txn.request_buf,
                     .addr = txn.remote_addr,
-                };
+                } };
             }
         }
         return null;
@@ -318,13 +337,29 @@ pub const TransactionLayer = struct {
             .branch = branch,
             .method = method,
         };
-
         if (self.map.fetchRemove(id)) |kv| {
             self.allocator.free(kv.key.branch);
             self.allocator.free(kv.value.request_buf);
             if (kv.value.response_buf) |resp| {
                 self.allocator.free(resp);
             }
+        }
+    }
+
+    /// Removes all terminated transactions, freeing their buffers.
+    /// Collects keys first so removal never runs mid-iteration.
+    pub fn sweepTerminated(self: *TransactionLayer) !void {
+        var dead: std.ArrayList(TransactionId) = .empty;
+        defer dead.deinit(self.allocator);
+
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.state == .terminated) {
+                try dead.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+        for (dead.items) |id| {
+            self.removeTransaction(id.branch, id.method);
         }
     }
 };
@@ -437,4 +472,112 @@ test "removeTransaction" {
 
     layer.removeTransaction(branch, .INVITE);
     try std.testing.expectEqual(@as(usize, 0), layer.map.count());
+}
+
+test "tick retransmits overdue invite transaction with backoff" {
+    const io = std.testing.io;
+    var layer = TransactionLayer.init(std.testing.allocator, io);
+    defer layer.deinit();
+
+    const branch = "z9hG4bKtick";
+    const request = "INVITE sip:test@pbx.local SIP/2.0\r\n\r\n";
+    const addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 100 }, .port = 5060 } };
+
+    try layer.createInviteTransaction(branch, request, addr);
+    // Force the timer overdue without real sleeping.
+    layer.getTransaction(branch, .INVITE).?.next_fire_at_ms = 0;
+
+    const fired = layer.tick();
+    try std.testing.expect(fired != null);
+    const r = fired.?.retransmit;
+    try std.testing.expectEqualStrings(request, r.data);
+    try std.testing.expectEqual(addr, r.addr);
+
+    const txn = layer.getTransaction(branch, .INVITE).?;
+    try std.testing.expectEqual(@as(u8, 1), txn.retransmit_count);
+    try std.testing.expectEqual(@as(u32, 1000), txn.t1_ms);
+}
+
+test "tick caps backoff at T2" {
+    const io = std.testing.io;
+    var layer = TransactionLayer.init(std.testing.allocator, io);
+    defer layer.deinit();
+
+    const branch = "z9hG4bKcap";
+    const request = "INVITE sip:test@pbx.local SIP/2.0\r\n\r\n";
+    const addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 100 }, .port = 5060 } };
+
+    try layer.createInviteTransaction(branch, request, addr);
+    const txn = layer.getTransaction(branch, .INVITE).?;
+    txn.t1_ms = t2_ms;
+    txn.next_fire_at_ms = 0;
+
+    const fired = layer.tick();
+    try std.testing.expect(fired != null);
+    try std.testing.expectEqual(t2_ms, layer.getTransaction(branch, .INVITE).?.t1_ms);
+}
+
+test "tick terminates invite transaction after Timer B" {
+    const io = std.testing.io;
+    var layer = TransactionLayer.init(std.testing.allocator, io);
+    defer layer.deinit();
+
+    const branch = "z9hG4bKtimerb";
+    const request = "INVITE sip:test@pbx.local SIP/2.0\r\n\r\n";
+    const addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 100 }, .port = 5060 } };
+
+    try layer.createInviteTransaction(branch, request, addr);
+    const txn = layer.getTransaction(branch, .INVITE).?;
+    txn.retransmit_count = 63;
+    txn.next_fire_at_ms = 0;
+
+    // 64th retransmit arms Timer B but still returns the request.
+    const fired = layer.tick();
+    try std.testing.expect(fired != null);
+    try std.testing.expect(fired.? == .retransmit);
+    try std.testing.expect(layer.getTransaction(branch, .INVITE).?.timer_b_fired);
+
+    // Next fire with Timer B armed terminates and reports expiry.
+    layer.getTransaction(branch, .INVITE).?.next_fire_at_ms = 0;
+    const expired = layer.tick();
+    try std.testing.expect(expired != null);
+    const id = expired.?.expired;
+    try std.testing.expectEqualStrings(branch, id.branch);
+    try std.testing.expectEqual(msg.Method.INVITE, id.method);
+    try std.testing.expectEqual(TransactionState.terminated, layer.getTransaction(branch, .INVITE).?.state);
+}
+
+test "nextTimeout defaults to Timer D when empty, zero when overdue" {
+    const io = std.testing.io;
+    var layer = TransactionLayer.init(std.testing.allocator, io);
+    defer layer.deinit();
+
+    try std.testing.expectEqual(@as(i64, timer_d_ms), layer.nextTimeout());
+
+    const branch = "z9hG4bKnto";
+    const request = "INVITE sip:test@pbx.local SIP/2.0\r\n\r\n";
+    const addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 100 }, .port = 5060 } };
+
+    try layer.createInviteTransaction(branch, request, addr);
+    layer.getTransaction(branch, .INVITE).?.next_fire_at_ms = 0;
+    try std.testing.expectEqual(@as(i64, 0), layer.nextTimeout());
+}
+
+test "sweepTerminated removes only terminated transactions" {
+    const io = std.testing.io;
+    var layer = TransactionLayer.init(std.testing.allocator, io);
+    defer layer.deinit();
+
+    const addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 100 }, .port = 5060 } };
+
+    try layer.createInviteTransaction("z9hG4bKdead", "INVITE sip:a@pbx.local SIP/2.0\r\n\r\n", addr);
+    try layer.createInviteTransaction("z9hG4bKlive", "INVITE sip:b@pbx.local SIP/2.0\r\n\r\n", addr);
+    try std.testing.expectEqual(@as(usize, 2), layer.map.count());
+
+    layer.setTerminated("z9hG4bKdead", .INVITE);
+    try layer.sweepTerminated();
+
+    try std.testing.expectEqual(@as(usize, 1), layer.map.count());
+    try std.testing.expect(layer.getTransaction("z9hG4bKdead", .INVITE) == null);
+    try std.testing.expect(layer.getTransaction("z9hG4bKlive", .INVITE) != null);
 }

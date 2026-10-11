@@ -22,6 +22,12 @@ pub const Call = struct {
     callee_contact_addr: ?std.Io.net.IpAddress = null,
     callee_resp_addr: ?std.Io.net.IpAddress = null,
     invite_branch: ?[]const u8 = null,
+    /// Owned dupes of the original INVITE headers, for rendering a 408
+    /// after the receive buffer is reused. Null until an INVITE is forwarded.
+    caller_via: ?[]u8 = null,
+    caller_from: ?[]u8 = null,
+    caller_to: ?[]u8 = null,
+    invite_cseq: u32 = 0,
 };
 
 pub fn removeCall(
@@ -32,6 +38,9 @@ pub fn removeCall(
     if (calls.fetchRemove(call_id)) |kv| {
         allocator.free(kv.key);
         if (kv.value.invite_branch) |b| allocator.free(b);
+        if (kv.value.caller_via) |v| allocator.free(v);
+        if (kv.value.caller_from) |f| allocator.free(f);
+        if (kv.value.caller_to) |t| allocator.free(t);
     }
 }
 
@@ -41,15 +50,14 @@ pub fn putCall(
     call_id: []const u8,
     call: Call,
 ) !void {
-    const key = try allocator.dupe(u8, call_id);
-    errdefer allocator.free(key);
-
-    if (calls.getPtr(key)) |entry| {
-        entry.* = call;
-        allocator.free(key);
-        return;
+    const gop = try calls.getOrPut(call_id);
+    if (gop.found_existing) {
+        gop.value_ptr.* = call;
+    } else {
+        errdefer _ = calls.remove(call_id);
+        gop.key_ptr.* = try allocator.dupe(u8, call_id);
+        gop.value_ptr.* = call;
     }
-    try calls.put(key, call);
 }
 
 pub fn addressEqual(a: std.Io.net.IpAddress, b: std.Io.net.IpAddress) bool {
@@ -85,12 +93,12 @@ test "Call default state is proceeding" {
 }
 
 test "CallState has all expected states" {
-    try testing.expect(@as(u16, @intFromEnum(CallState.proceeding)) == 0);
-    try testing.expect(@as(u16, @intFromEnum(CallState.ringing)) == 1);
-    try testing.expect(@as(u16, @intFromEnum(CallState.answered)) == 2);
-    try testing.expect(@as(u16, @intFromEnum(CallState.established)) == 3);
-    try testing.expect(@as(u16, @intFromEnum(CallState.canceling)) == 4);
-    try testing.expect(@as(u16, @intFromEnum(CallState.terminated)) == 5);
+    try testing.expect(@as(u16, @backingInt(CallState.proceeding)) == 0);
+    try testing.expect(@as(u16, @backingInt(CallState.ringing)) == 1);
+    try testing.expect(@as(u16, @backingInt(CallState.answered)) == 2);
+    try testing.expect(@as(u16, @backingInt(CallState.established)) == 3);
+    try testing.expect(@as(u16, @backingInt(CallState.canceling)) == 4);
+    try testing.expect(@as(u16, @backingInt(CallState.terminated)) == 5);
 }
 
 test "putCall inserts new call" {

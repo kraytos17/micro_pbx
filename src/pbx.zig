@@ -1,15 +1,16 @@
 //! Stateful PBX core: owns call table, transactions, RTP sessions, and dispatch.
 
 const std = @import("std");
-const transport = @import("transport.zig");
-const msg = @import("sip/message.zig");
-const parser = @import("sip/parser.zig");
-const registrar = @import("registrar.zig");
+
+const call = @import("call.zig");
 const proxy = @import("proxy.zig");
+const registrar = @import("registrar.zig");
 const rtp = @import("rtp.zig");
 const sdp = @import("sdp.zig");
-const call = @import("call.zig");
+const msg = @import("sip/message.zig");
+const parser = @import("sip/parser.zig");
 const txn = @import("sip/transaction.zig");
+const transport = @import("transport.zig");
 
 const log = std.log.scoped(.main);
 
@@ -37,6 +38,7 @@ pub const Pbx = struct {
             .rtp_sockets = std.ArrayList(transport.UdpSocket).initCapacity(allocator, 32) catch unreachable,
             .pbx_addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 127, 0, 0, 1 }, .port = port } },
         };
+
         errdefer self.deinit();
         return self;
     }
@@ -50,6 +52,9 @@ pub const Pbx = struct {
         while (it.next()) |kv| {
             self.allocator.free(kv.key_ptr.*);
             if (kv.value_ptr.*.invite_branch) |b| self.allocator.free(b);
+            if (kv.value_ptr.*.caller_via) |v| self.allocator.free(v);
+            if (kv.value_ptr.*.caller_from) |f| self.allocator.free(f);
+            if (kv.value_ptr.*.caller_to) |t| self.allocator.free(t);
         }
 
         self.calls.deinit();
@@ -66,14 +71,24 @@ pub const Pbx = struct {
         var resp_buf: [4096]u8 = undefined;
         var fwd_buf: [4096]u8 = undefined;
         var rtp_buf: [2048]u8 = undefined;
-
         while (true) {
+            // Drain RTP relay sockets without blocking: a zero-duration
+            // timeout turns each read into a poll so SIP signaling stays
+            // responsive once relay sockets exist.
+            const poll = transport.pollTimeout();
             for (self.rtp_sockets.items) |*rtp_sock| {
-                const result = rtp_sock.recvFrom(&rtp_buf) catch continue;
-                rtp.handleRtpPacket(result.data, result.from, &self.rtp_sessions, &self.socket) catch continue;
+                const rtp_result = rtp_sock.recvFromTimeout(&rtp_buf, poll) catch continue;
+                rtp.handleRtpPacket(rtp_result.data, rtp_result.from, &self.rtp_sessions, &self.socket) catch continue;
             }
 
-            const result = self.socket.recvFrom(&recv_buf) catch |err| {
+            // Block on SIP only until the next transaction timer fires.
+            const sip_timeout = transport.timeoutMs(self.txn_layer.nextTimeout());
+            const result = self.socket.recvFromTimeout(&recv_buf, sip_timeout) catch |err| {
+                if (err == error.Timeout) {
+                    self.handleTimeout();
+                    continue;
+                }
+
                 log.err("recvFrom error: {}", .{err});
                 continue;
             };
@@ -126,6 +141,60 @@ pub const Pbx = struct {
         try proxy.handleRegister(req, from, &self.reg, &self.socket, resp_buf);
     }
 
+    /// Timer pass: resends every firing transaction request, then frees
+    /// terminated transactions. Resends happen before the sweep because
+    /// tick() returns slices borrowing map memory.
+    fn handleTimeout(self: *Pbx) void {
+        while (self.txn_layer.tick()) |ev| {
+            switch (ev) {
+                .retransmit => |r| {
+                    self.socket.sendTo(r.data, r.addr) catch |err| {
+                        log.err("retransmit {s} failed: {}", .{ r.branch, err });
+                    };
+                },
+                .expired => |id| {
+                    if (id.method == .INVITE) self.onInviteTimeout(id.branch);
+                },
+            }
+        }
+        self.txn_layer.sweepTerminated() catch |err| {
+            log.err("sweepTerminated failed: {}", .{err});
+        };
+    }
+
+    /// Handles a Timer B expiry: 408s the caller and tears down the call.
+    /// Scans calls by invite branch (O(n), n is tiny; no index needed).
+    fn onInviteTimeout(self: *Pbx, branch: []const u8) void {
+        var it = self.calls.iterator();
+        while (it.next()) |kv| {
+            const call_ctx = kv.value_ptr;
+            const invite_branch = call_ctx.invite_branch orelse continue;
+            if (!std.mem.eql(u8, invite_branch, branch)) continue;
+
+            const call_id = kv.key_ptr.*;
+            var resp_buf: [2048]u8 = undefined;
+            const timeout_resp = proxy.buildTimeoutResponse(
+                &resp_buf,
+                call_id,
+                call_ctx.invite_cseq,
+                call_ctx.caller_via orelse "",
+                call_ctx.caller_from orelse "",
+                call_ctx.caller_to orelse "",
+            ) catch |err| {
+                log.err("buildTimeoutResponse failed: {}", .{err});
+                return;
+            };
+
+            self.socket.sendTo(timeout_resp, call_ctx.caller_addr) catch |err| {
+                log.err("send 408 to caller failed: {}", .{err});
+            };
+
+            log.info("call {s} terminated (408 Request Timeout)", .{call_id});
+            call.removeCall(&self.calls, self.allocator, call_id);
+            return;
+        }
+    }
+
     fn onInvite(
         self: *Pbx,
         req: msg.Request,
@@ -164,7 +233,6 @@ pub const Pbx = struct {
 
                 // Send the 404
                 try proxy.sendResponseWithBranch(&self.socket, from, resp_buf, 404, "Not Found", req, branch_404);
-
                 // Cache the 404 response for retransmissions using client's branch
                 try self.txn_layer.createNonInviteTransaction(req.via_branch, .INVITE, response_404, from);
                 try self.txn_layer.storeResponse(req.via_branch, .INVITE, response_404);
@@ -173,7 +241,6 @@ pub const Pbx = struct {
             };
 
             call_ctx.callee_contact_addr = contact.address;
-
             // Create an RTP session from the caller's SDP so the media relay
             // can rewrite the callee's SDP and open relay sockets on ACK.
             if (req.content_type) |ct| {
@@ -192,6 +259,15 @@ pub const Pbx = struct {
 
             if (call_ctx.invite_branch) |old| self.allocator.free(old);
             call_ctx.invite_branch = self.allocator.dupe(u8, invite_result.branch) catch null;
+
+            if (call_ctx.caller_via) |old| self.allocator.free(old);
+            if (call_ctx.caller_from) |old| self.allocator.free(old);
+            if (call_ctx.caller_to) |old| self.allocator.free(old);
+
+            call_ctx.caller_via = self.allocator.dupe(u8, req.via) catch null;
+            call_ctx.caller_from = self.allocator.dupe(u8, req.from) catch null;
+            call_ctx.caller_to = self.allocator.dupe(u8, req.to) catch null;
+            call_ctx.invite_cseq = req.cseq_num;
             arena.allocator().free(invite_result.branch);
             try call.putCall(&self.calls, self.allocator, req.call_id, call_ctx);
         } else {
@@ -254,6 +330,9 @@ pub const Pbx = struct {
             proxy.handleBye(req, dest_addr, &self.reg, &self.socket, self.pbx_addr, branch, fwd_buf) catch |err| {
                 log.err("handleBye error: {}", .{err});
             };
+
+            // Stop any Timer A retransmits of the original INVITE (no-op if gone).
+            if (call_ctx.invite_branch) |b| self.txn_layer.removeTransaction(b, .INVITE);
             call.removeCall(&self.calls, self.allocator, req.call_id);
             self.rtp_sessions.removeSession(req.call_id);
         } else {
@@ -348,6 +427,8 @@ pub const Pbx = struct {
                             proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
                                 log.err("handleResponse 2xx: {}", .{err});
                             };
+                            // RFC 3261: INVITE client transaction ends on 2xx, no Timer D.
+                            self.txn_layer.removeTransaction(resp.via_branch, .INVITE);
                         } else if (call_ctx.state == .canceling) {
                             call_ctx.state = .answered;
                             log.info("call {s} answered after CANCEL race ({d} {s})", .{ resp.call_id, resp.status_code, resp.reason_phrase });
@@ -355,11 +436,17 @@ pub const Pbx = struct {
                             proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
                                 log.err("handleResponse 2xx race: {}", .{err});
                             };
+                            self.txn_layer.removeTransaction(resp.via_branch, .INVITE);
                         }
                     } else {
                         proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
                             log.err("handleResponse non-invite: {}", .{err});
                         };
+
+                        self.txn_layer.storeResponse(resp.via_branch, resp.cseq_method, data) catch |err| {
+                            log.err("storeResponse failed: {}", .{err});
+                        };
+                        self.txn_layer.setCompleted(resp.via_branch, resp.cseq_method);
                     }
                 },
                 .redirect, .client_error, .server_error, .global_error => {
@@ -369,6 +456,12 @@ pub const Pbx = struct {
                         proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
                             log.err("handleResponse 487: {}", .{err});
                         };
+
+                        self.txn_layer.storeResponse(resp.via_branch, resp.cseq_method, data) catch |err| {
+                            log.err("storeResponse failed: {}", .{err});
+                        };
+
+                        self.txn_layer.setCompleted(resp.via_branch, resp.cseq_method);
                         call.removeCall(&self.calls, self.allocator, resp.call_id);
                     } else if (call_ctx.state != .terminated) {
                         call_ctx.state = .terminated;
@@ -376,6 +469,12 @@ pub const Pbx = struct {
                         proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
                             log.err("handleResponse final: {}", .{err});
                         };
+
+                        self.txn_layer.storeResponse(resp.via_branch, resp.cseq_method, data) catch |err| {
+                            log.err("storeResponse failed: {}", .{err});
+                        };
+
+                        self.txn_layer.setCompleted(resp.via_branch, resp.cseq_method);
                         call.removeCall(&self.calls, self.allocator, resp.call_id);
                     }
                 },
@@ -762,4 +861,152 @@ test "e2e CANCEL with missing callee sends 481" {
         "\r\n");
     // Must not error: the 481 is sent internally
     try server.onCancel(cancel_req, test_alice_addr, &resp_buf, &fwd_buf);
+}
+
+test "e2e handleTimeout retransmits overdue INVITE transaction" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+
+    const call_id = "call-timer";
+    try inviteBob(&server, call_id, "z9hG4bKtimer", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try std.testing.expectEqual(@as(usize, 1), server.txn_layer.map.count());
+
+    // Force the forwarded INVITE transaction (PBX-generated branch) overdue.
+    var it = server.txn_layer.map.iterator();
+    const stored = it.next().?;
+    const branch = stored.key_ptr.branch;
+    const method = stored.key_ptr.method;
+    stored.value_ptr.next_fire_at_ms = 0;
+
+    // handleTimeout resends over loopback UDP and backs the timer off.
+    server.handleTimeout();
+    const fired_txn = server.txn_layer.getTransaction(branch, method).?;
+    try std.testing.expectEqual(@as(u8, 1), fired_txn.retransmit_count);
+    try std.testing.expectEqual(@as(u32, 1000), fired_txn.t1_ms);
+}
+
+test "e2e Timer B expiry sends 408 and tears down the call" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+
+    const call_id = "call-timeout";
+    try inviteBob(&server, call_id, "z9hG4bKtimeout", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id).?.state == .proceeding);
+
+    // Arm Timer B on the forwarded-INVITE transaction and force it overdue.
+    var it = server.txn_layer.map.iterator();
+    const stored = it.next().?;
+    stored.value_ptr.timer_b_fired = true;
+    stored.value_ptr.next_fire_at_ms = 0;
+
+    server.handleTimeout();
+
+    // Caller got the 408 (verified byte-exact at the builder level);
+    // the call is gone and the transaction is swept.
+    try std.testing.expect(server.calls.get(call_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), server.txn_layer.map.count());
+}
+
+test "e2e 2xx removes the INVITE client transaction" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+
+    const call_id = "call-2xx";
+    try inviteBob(&server, call_id, "z9hG4bK2xx", test_alice_addr, false, &resp_buf, &fwd_buf);
+    const invite_branch = server.calls.get(call_id).?.invite_branch.?;
+
+    var raw_buf: [1024]u8 = undefined;
+    const raw = std.fmt.bufPrint(&raw_buf, "SIP/2.0 200 OK\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch={s}\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-2xx\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", .{invite_branch}) catch unreachable;
+    try deliverResponse(&server, raw, test_bob_addr, &fwd_buf);
+
+    try std.testing.expect(server.calls.get(call_id).?.state == .answered);
+    try std.testing.expect(server.txn_layer.getTransaction(invite_branch, .INVITE) == null);
+}
+
+test "e2e 486 completes the transaction and Timer D sweeps it" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+
+    const call_id = "call-busy";
+    try inviteBob(&server, call_id, "z9hG4bKbusy", test_alice_addr, false, &resp_buf, &fwd_buf);
+    // Own the branch: handleResponse tears down the call (freeing the
+    // map-owned slice) before we look the transaction up below.
+    const invite_branch = try std.testing.allocator.dupe(u8, server.calls.get(call_id).?.invite_branch.?);
+    defer std.testing.allocator.free(invite_branch);
+
+    var raw_buf: [1024]u8 = undefined;
+    const raw = std.fmt.bufPrint(&raw_buf, "SIP/2.0 486 Busy Here\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch={s}\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-busy\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", .{invite_branch}) catch unreachable;
+    try deliverResponse(&server, raw, test_bob_addr, &fwd_buf);
+
+    // Final error: call torn down, response cached, transaction completed.
+    try std.testing.expect(server.calls.get(call_id) == null);
+    const tm = server.txn_layer.getTransaction(invite_branch, .INVITE);
+    try std.testing.expect(tm != null);
+    try std.testing.expectEqual(txn.TransactionState.completed, tm.?.state);
+    try std.testing.expect(tm.?.response_buf != null);
+
+    // Timer D expiry terminates silently; the sweep frees the entry.
+    tm.?.next_fire_at_ms = 0;
+    server.handleTimeout();
+    try std.testing.expect(server.txn_layer.getTransaction(invite_branch, .INVITE) == null);
+}
+
+test "e2e BYE removes the INVITE client transaction" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+
+    const call_id = "call-byetxn";
+    try inviteBob(&server, call_id, "z9hG4bKbyetxn", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try std.testing.expectEqual(@as(usize, 1), server.txn_layer.map.count());
+
+    const bye_req = try parseRequest("BYE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbyetxn1\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-byetxn\r\n" ++
+        "CSeq: 2 BYE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onBye(bye_req, test_alice_addr, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), server.txn_layer.map.count());
 }
