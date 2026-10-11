@@ -52,7 +52,10 @@ pub fn rewriteSdp(
     var lines = std.mem.splitScalar(u8, body, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, "\r");
-        if (line.len > 8 and std.mem.eql(u8, line[0..8], "c=IN IP4 ")) {
+        // SDP has no empty lines; skipping avoids a spurious trailing CRLF
+        // from the input's final newline (which would also skew lengths).
+        if (line.len == 0) continue;
+        if (line.len > 9 and std.mem.eql(u8, line[0..9], "c=IN IP4 ")) {
             try result.appendSlice(allocator, "c=IN IP4 ");
             try result.appendSlice(allocator, new_ip);
             try result.appendSlice(allocator, "\r\n");
@@ -62,7 +65,20 @@ pub fn rewriteSdp(
             defer allocator.free(port_str);
             try result.appendSlice(allocator, port_str);
             try result.appendSlice(allocator, " RTP/AVP ");
-            const rest = line[18..];
+            // Payload formats follow the third space ("m=audio <port> RTP/AVP <fmts...>").
+            // A hardcoded offset breaks for ports of different lengths.
+            var spaces: usize = 0;
+            var rest: []const u8 = "";
+            for (line, 0..) |c, i| {
+                if (c == ' ') {
+                    spaces += 1;
+                    if (spaces == 3) {
+                        rest = line[i + 1 ..];
+                        break;
+                    }
+                }
+            }
+
             try result.appendSlice(allocator, rest);
             try result.appendSlice(allocator, "\r\n");
         } else {
@@ -85,4 +101,25 @@ test "parse SDP basic" {
     try std.testing.expectEqualStrings("192.168.1.5", info.ip_addr);
     try std.testing.expectEqual(@as(u16, 8000), info.port);
     try std.testing.expectEqual(@as(u7, 0), info.payload_type);
+}
+
+test "rewrite SDP substitutes IP and port" {
+    const sdp =
+        "v=0\r\n" ++
+        "o=alice 123456 789 IN IP4 192.168.1.5\r\n" ++
+        "s=Session\r\n" ++
+        "c=IN IP4 192.168.1.5\r\n" ++
+        "m=audio 8000 RTP/AVP 0\r\n";
+
+    const out = try rewriteSdp(sdp, "127.0.0.1", 10000, std.testing.allocator);
+    defer std.testing.allocator.free(out);
+
+    try std.testing.expectEqualStrings(
+        "v=0\r\n" ++
+            "o=alice 123456 789 IN IP4 192.168.1.5\r\n" ++
+            "s=Session\r\n" ++
+            "c=IN IP4 127.0.0.1\r\n" ++
+            "m=audio 10000 RTP/AVP 0\r\n",
+        out,
+    );
 }

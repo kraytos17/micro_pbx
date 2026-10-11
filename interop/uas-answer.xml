@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="ISO-8859-1" ?>
 <!DOCTYPE scenario SYSTEM "sipp.dtd">
 <!-- Callee side for S4/S5: handles ONE dialog starting at the INVITE.
-     Bob must already be registered from this port (see uas-reg.xml, run
+     Bob must already be registered from this port (via register.py, run
      before this process starts): the REGISTER exchange needs this socket's
      own Call-ID, while the dialog arrives under the caller's foreign one,
      so the two cannot share a scenario run. -->

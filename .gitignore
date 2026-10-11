@@ -2,3 +2,7 @@
 zig-out/
 *.o
 interop/logs
+interop/.venv/
+interop/.pytest_cache/
+__pycache__/
+*.pyc

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="ISO-8859-1" ?>
 <!DOCTYPE scenario SYSTEM "sipp.dtd">
-<!-- Callee side for S6: handles one dialog (see uas-reg.xml note on why
-     REGISTER lives in a separate run). On INVITE waits for the CANCEL,
+<!-- Callee side for S6: handles one dialog (REGISTER lives in a separate
+     run — see the note in uas-answer.xml on why). On INVITE waits for the CANCEL,
      answers 200 to the CANCEL plus 487 to the INVITE. The INVITE CSeq
      number is saved because [last_CSeq:] is overwritten by the CANCEL. -->
 <scenario name="pbx-callee-cancel">

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+const auth = @import("auth.zig");
 const reg = @import("registrar.zig");
 const rtp = @import("rtp.zig");
 const sdp = @import("sdp.zig");
@@ -163,10 +164,9 @@ pub fn handleResponse(
         if (rtp_sessions.getSession(resp.call_id)) |session| {
             if (resp.body.len > 0) {
                 const callee_sdp = try sdp.parseSdp(resp.body);
-                session.callee_ip = callee_addr;
-                session.callee_payload_type = callee_sdp.payload_type;
+                rtp_sessions.setCallee(resp.call_id, callee_addr, callee_sdp.port, callee_sdp.payload_type);
 
-                const rewritten_sdp = try sdp.rewriteSdp(resp.body, "127.0.0.1", session.callee_rtp_port, allocator);
+                const rewritten_sdp = try sdp.rewriteSdp(resp.body, "127.0.0.1", session.relay_caller_port, allocator);
                 defer allocator.free(rewritten_sdp);
 
                 const rewritten_buf = try buildResponseWithSdp(resp, fwd_buf, rewritten_sdp, false);
@@ -204,9 +204,20 @@ pub fn handleRegister(
     req: msg.Request,
     from_addr: std.Io.net.IpAddress,
     registrar: *reg.Registrar,
+    authenticator: *auth.Auth,
     socket: *transport.UdpSocket,
     resp_buf: []u8,
+    allocator: std.mem.Allocator,
 ) !void {
+    const username = authenticator.verifyRequest(req) catch |err| {
+        // Authentication failures are answers, not errors: challenge the
+        // client (stale nonces say so explicitly per RFC 3261).
+        const stale = err == error.StaleNonce;
+        if (stale) log.info("stale nonce for {s}, re-challenging", .{req.request_uri});
+        return try sendUnauthorized(socket, from_addr, authenticator, resp_buf, req, allocator, stale);
+    };
+
+    log.debug("REGISTER {s} authenticated as {s}", .{ req.request_uri, username });
     const aor = extractUri(req.to);
     if (req.expires) |exp| {
         if (exp == 0) {
@@ -239,6 +250,7 @@ pub fn buildResponse(
     status: u16,
     reason: []const u8,
     req: msg.Request,
+    www_authenticate: ?[]const u8,
 ) ![]u8 {
     var w = std.Io.Writer.fixed(buf);
     try emit(&w, "SIP/2.0 {d} {s}\r\n", .{ status, reason });
@@ -249,6 +261,9 @@ pub fn buildResponse(
     try emit(&w, "To: {s}\r\n", .{req.to});
     try emit(&w, "Call-ID: {s}\r\n", .{req.call_id});
     try emit(&w, "CSeq: {d} {s}\r\n", .{ req.cseq_num, req.cseq_method.toSlice() });
+    if (www_authenticate) |wa| {
+        try emit(&w, "WWW-Authenticate: {s}\r\n", .{wa});
+    }
     if (req.contact) |c| {
         try emit(&w, "Contact: {s}\r\n", .{c});
     }
@@ -312,6 +327,23 @@ pub fn sendResponseWithBranch(
 
     try emit(&w, "Content-Length: 0\r\n\r\n", .{});
     try socket.sendTo(w.buffered(), to);
+}
+
+/// Answers 401 with a fresh nonce challenge.
+fn sendUnauthorized(
+    socket: *transport.UdpSocket,
+    to: std.Io.net.IpAddress,
+    authenticator: *auth.Auth,
+    buf: []u8,
+    req: msg.Request,
+    allocator: std.mem.Allocator,
+    stale: bool,
+) !void {
+    const nonce = try authenticator.issueNonce();
+    const www_auth = try auth.challenge(allocator, nonce[0..], stale);
+    defer allocator.free(www_auth);
+    const response = try buildResponse(buf, 401, "Unauthorized", req, www_auth);
+    try socket.sendTo(response, to);
 }
 
 /// Generates a random RFC 3261-style branch identifier.
@@ -475,6 +507,7 @@ fn mfTestRequest(max_forwards: ?u32) msg.Request {
         .expires = null,
         .content_type = null,
         .max_forwards = max_forwards,
+        .authorization = null,
         .body = "",
     };
 }
@@ -497,6 +530,19 @@ test "buildForwardedRequest rejects exhausted Max-Forwards" {
     var buf: [2048]u8 = undefined;
     const out = buildForwardedRequest(mfTestRequest(0), mfTestPbxAddr, "z9hG4bKfwd", &buf);
     try std.testing.expectError(error.MaxForwardsExceeded, out);
+}
+
+test "buildResponse emits WWW-Authenticate when given" {
+    var buf: [1024]u8 = undefined;
+    const out = try buildResponse(&buf, 401, "Unauthorized", mfTestRequest(70), "Digest realm=\"pbx\", nonce=\"abc\", algorithm=MD5");
+    try std.testing.expect(std.mem.find(u8, out, "SIP/2.0 401 Unauthorized\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, out, "WWW-Authenticate: Digest realm=\"pbx\", nonce=\"abc\", algorithm=MD5\r\n") != null);
+}
+
+test "buildResponse omits WWW-Authenticate when null" {
+    var buf: [1024]u8 = undefined;
+    const out = try buildResponse(&buf, 404, "Not Found", mfTestRequest(70), null);
+    try std.testing.expect(std.mem.find(u8, out, "WWW-Authenticate:") == null);
 }
 
 test "stripTopVia removes only the first value of a folded Via" {

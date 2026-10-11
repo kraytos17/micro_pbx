@@ -2,7 +2,7 @@
 <!DOCTYPE scenario SYSTEM "sipp.dtd">
 <!-- Caller side for S4/S5: full dialog REGISTERed alice -> INVITE bob with
      SDP -> 100/180/200 -> ACK -> BYE -> 200. Bob must already be registered
-     (the UAS scenario self-registers before answering). -->
+     from the UAS port (via register.py, run before the UAS starts). -->
 <scenario name="pbx-caller-call">
   <send retrans="500">
     <![CDATA[

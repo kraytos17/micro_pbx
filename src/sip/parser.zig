@@ -52,6 +52,7 @@ fn parseRequest(
         .expires = null,
         .content_type = null,
         .max_forwards = null,
+        .authorization = null,
         .body = body,
     };
 
@@ -132,6 +133,8 @@ fn parseRequestHeaders(out: *msg.Request, lines: *std.mem.SplitIterator(u8, .seq
             out.content_type = value;
         } else if (std.mem.eql(u8, key_lower, "max-forwards")) {
             out.max_forwards = std.fmt.parseInt(u32, value, 10) catch null;
+        } else if (std.mem.eql(u8, key_lower, "authorization")) {
+            out.authorization = value;
         }
     }
 }

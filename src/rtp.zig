@@ -52,12 +52,25 @@ pub const Header = packed struct {
 };
 
 /// One active media leg, keyed by SIP Call-ID.
+///
+/// UA endpoints (caller_*/callee_*) are the real party addresses: matching
+/// and forwarding always use these. relay_* are PBX-bound ports advertised
+/// in rewritten SDPs; media flows UA -> PBX relay -> UA.
 pub const Session = struct {
     call_id: []u8,
-    caller_rtp_port: u16,
-    callee_rtp_port: u16,
     caller_ip: net.IpAddress,
+    /// Caller's UA media port (from its SDP). Never changes.
+    caller_rtp_port: u16,
     callee_ip: net.IpAddress,
+    /// Callee's UA media port (from its 200 OK SDP). 0 until answered.
+    callee_rtp_port: u16,
+    /// PBX-bound relay ports advertised to caller / callee respectively.
+    relay_caller_port: u16,
+    relay_callee_port: u16,
+    /// Relay sockets, opened on ACK. Owned here: closed exactly once by
+    /// removeSession/deinit, never copied elsewhere (fd discipline).
+    caller_sock: ?transport.UdpSocket,
+    callee_sock: ?transport.UdpSocket,
     caller_payload_type: u7,
     callee_payload_type: u7,
 };
@@ -79,6 +92,8 @@ pub const Sessions = struct {
     pub fn deinit(self: *Sessions) void {
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
+            if (entry.value_ptr.caller_sock) |*sock| sock.deinit();
+            if (entry.value_ptr.callee_sock) |*sock| sock.deinit();
             self.allocator.free(entry.key_ptr.*);
         }
         self.sessions.deinit();
@@ -92,17 +107,24 @@ pub const Sessions = struct {
         caller_pt: u7,
     ) !Session {
         if (self.next_port > 60000) self.next_port = 10000;
-        const callee_port = self.next_port;
-        self.next_port += 2;
+        const relay_caller = self.next_port;
+        const relay_callee = self.next_port + 2;
+        self.next_port += 4;
 
         const call_id_owned = try self.allocator.dupe(u8, call_id);
         errdefer self.allocator.free(call_id_owned);
         const session = Session{
             .call_id = call_id_owned,
-            .caller_rtp_port = caller_port,
-            .callee_rtp_port = callee_port,
             .caller_ip = caller_ip,
+            .caller_rtp_port = caller_port,
             .callee_ip = .{ .ip4 = net.Ip4Address.unspecified(0) },
+            // Unknown until the callee answers; the port-0 guard in the
+            // relay path depends on this sentinel.
+            .callee_rtp_port = 0,
+            .relay_caller_port = relay_caller,
+            .relay_callee_port = relay_callee,
+            .caller_sock = null,
+            .callee_sock = null,
             .caller_payload_type = caller_pt,
             .callee_payload_type = 0,
         };
@@ -115,39 +137,77 @@ pub const Sessions = struct {
         return self.sessions.getPtr(call_id);
     }
 
+    /// Records the callee's answered media endpoint (from its 200 OK SDP).
+    /// Unknown calls are ignored.
+    pub fn setCallee(
+        self: *Sessions,
+        call_id: []const u8,
+        callee_ip: net.IpAddress,
+        callee_port: u16,
+        callee_pt: u7,
+    ) void {
+        const session = self.sessions.getPtr(call_id) orelse return;
+        session.callee_ip = callee_ip;
+        session.callee_rtp_port = callee_port;
+        session.callee_payload_type = callee_pt;
+    }
+
     pub fn removeSession(self: *Sessions, call_id: []const u8) void {
+        if (self.sessions.getPtr(call_id)) |session| {
+            if (session.caller_sock) |*sock| sock.deinit();
+            if (session.callee_sock) |*sock| sock.deinit();
+            session.caller_sock = null;
+            session.callee_sock = null;
+        }
         if (self.sessions.fetchRemove(call_id)) |kv| {
             self.allocator.free(kv.key);
         }
     }
+
+    /// Polls every relay socket once (non-blocking). Routing resolves
+    /// positionally per session: no scans, no borrows beyond the entry.
+    pub fn drain(self: *Sessions, sip_socket: *transport.UdpSocket, rtp_buf: []u8) void {
+        const poll = transport.pollTimeout();
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            const session = entry.value_ptr;
+            if (session.caller_sock) |*sock| {
+                if (sock.recvFromTimeout(rtp_buf, poll)) |r| {
+                    relayPacket(r.data, r.from, session, sip_socket) catch continue;
+                } else |_| {}
+            }
+            if (session.callee_sock) |*sock| {
+                if (sock.recvFromTimeout(rtp_buf, poll)) |r| {
+                    relayPacket(r.data, r.from, session, sip_socket) catch continue;
+                } else |_| {}
+            }
+        }
+    }
 };
 
-/// Forwards an RTP packet between the two parties of a matching session.
-pub fn handleRtpPacket(
+/// Routes one RTP packet for a single session leg. Caller and callee legs
+/// are matched by exact UA endpoint; anything else is dropped. No map
+/// access here: the drain loop already holds the session, so routing is
+/// positional (O(1), no scans, no borrow conflicts).
+pub fn relayPacket(
     packet: []const u8,
-    from_addr: net.IpAddress,
-    sessions: *Sessions,
+    from: net.IpAddress,
+    session: *Session,
     sip_socket: *transport.UdpSocket,
 ) !void {
     _ = try Header.parse(packet);
-    var it = sessions.sessions.iterator();
-    while (it.next()) |entry| {
-        const session = entry.value_ptr;
-        if (std.mem.eql(u8, &from_addr.ip4.bytes, &session.caller_ip.ip4.bytes) and
-            from_addr.ip4.port == session.caller_rtp_port)
-        {
-            if (session.callee_ip.ip4.port != 0) {
-                log.debug("RTP: Forwarding from caller to callee: {} bytes", .{packet.len});
-                try sip_socket.sendToPort(packet, session.callee_ip, session.callee_rtp_port);
-                return;
-            }
-        } else if (std.mem.eql(u8, &from_addr.ip4.bytes, &session.callee_ip.ip4.bytes) and
-            from_addr.ip4.port == session.callee_rtp_port)
-        {
-            log.debug("RTP: Forwarding from callee to caller: {} bytes", .{packet.len});
-            try sip_socket.sendToPort(packet, session.caller_ip, session.caller_rtp_port);
-            return;
+    if (std.mem.eql(u8, &from.ip4.bytes, &session.caller_ip.ip4.bytes) and
+        from.ip4.port == session.caller_rtp_port)
+    {
+        if (session.callee_rtp_port != 0) {
+            log.debug("RTP: Forwarding from caller to callee: {} bytes", .{packet.len});
+            try sip_socket.sendToPort(packet, session.callee_ip, session.callee_rtp_port);
         }
+    } else if (std.mem.eql(u8, &from.ip4.bytes, &session.callee_ip.ip4.bytes) and
+        from.ip4.port == session.callee_rtp_port)
+    {
+        log.debug("RTP: Forwarding from callee to caller: {} bytes", .{packet.len});
+        try sip_socket.sendToPort(packet, session.caller_ip, session.caller_rtp_port);
     }
 }
 
@@ -288,19 +348,19 @@ test "RTP relay matches by IP and port, not port alone" {
 
     // Matching (IP, port) forwards the packet
     const matching_from = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 10 }, .port = 20000 } };
-    try handleRtpPacket(&packet, matching_from, &sessions, &relay);
+    try relayPacket(&packet, matching_from, session, &relay);
     var recv_buf: [64]u8 = undefined;
     const received = try dest.recvFrom(&recv_buf);
     try std.testing.expectEqual(@as(usize, 15), received.data.len);
 
     // Same RTP port but different IP must NOT forward (cross-talk guard)
     const wrong_ip = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 99 }, .port = 20000 } };
-    try handleRtpPacket(&packet, wrong_ip, &sessions, &relay);
+    try relayPacket(&packet, wrong_ip, session, &relay);
 
     // A matching packet forwarded now should arrive with no extra packet ahead
     // of it: if wrong_ip had been forwarded, this receive would see that packet
     // instead of the one we just sent.
-    try handleRtpPacket(&packet, matching_from, &sessions, &relay);
+    try relayPacket(&packet, matching_from, session, &relay);
     const second = try dest.recvFrom(&recv_buf);
     try std.testing.expectEqual(@as(usize, 15), second.data.len);
     try std.testing.expectEqualStrings(&packet, second.data);
@@ -328,7 +388,7 @@ test "RTP relay forwards callee to caller with intact bytes" {
     const packet = [_]u8{ 0x80, 0x08, 0xAB, 0xCD, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0xDE, 0xAD, 0xBE, 0xEF };
 
     const callee_from = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 20 }, .port = 30000 } };
-    try handleRtpPacket(&packet, callee_from, &sessions, &relay);
+    try relayPacket(&packet, callee_from, session, &relay);
 
     var recv_buf: [64]u8 = undefined;
     const received = try dest.recvFrom(&recv_buf);
@@ -354,7 +414,7 @@ test "RTP relay drops caller packet before callee SDP arrives" {
     const matching_from = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 10 }, .port = 20000 } };
 
     // Must return normally (no send target exists) and leave the session alone.
-    try handleRtpPacket(&packet, matching_from, &sessions, &relay);
+    try relayPacket(&packet, matching_from, session, &relay);
     try std.testing.expectEqual(@as(u16, 0), session.callee_ip.ip4.port);
 
     // Nothing was emitted toward the relay socket itself either.
@@ -375,8 +435,9 @@ test "RTP relay ignores packets from unknown sources" {
 
     const packet = [_]u8{ 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
     const stranger = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 10, 9, 9, 9 }, .port = 9999 } };
+    const session = sessions.getSession("call-unknown").?;
 
-    try handleRtpPacket(&packet, stranger, &sessions, &relay);
+    try relayPacket(&packet, stranger, session, &relay);
 }
 
 test "RTP header rejects bad version and short packets" {
@@ -387,4 +448,74 @@ test "RTP header rejects bad version and short packets" {
     var short: [8]u8 = @splat(0);
     short[0] = 0x80;
     try std.testing.expectError(error.PacketTooShort, Header.parse(&short));
+}
+
+test "setCallee records the answered endpoint, ignores unknown calls" {
+    var sessions = Sessions.init(std.testing.allocator);
+    defer sessions.deinit();
+
+    const caller_ip = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 10 }, .port = 5070 } };
+    _ = try sessions.createSession("call-1", 20000, caller_ip, 0);
+
+    // Pre-answer sentinel: unknown callee port.
+    try std.testing.expectEqual(@as(u16, 0), sessions.getSession("call-1").?.callee_rtp_port);
+
+    const callee_ip = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 20 }, .port = 5072 } };
+    sessions.setCallee("call-1", callee_ip, 4000, 8);
+
+    const session = sessions.getSession("call-1").?;
+    try std.testing.expectEqual(callee_ip, session.callee_ip);
+    try std.testing.expectEqual(@as(u16, 4000), session.callee_rtp_port);
+    try std.testing.expectEqual(@as(u7, 8), session.callee_payload_type);
+
+    // Unknown call IDs are silently ignored.
+    sessions.setCallee("call-missing", callee_ip, 4000, 8);
+}
+
+test "RTP relay end-to-end through session sockets, mismatched UA ports" {
+    const io = std.testing.io;
+    var sessions = Sessions.init(std.testing.allocator);
+    defer sessions.deinit();
+
+    // Two UAs on ephemeral loopback ports (deliberately different numbers,
+    // and different from the PBX relay range starting at 10000).
+    var caller = try transport.UdpSocket.init(io, 0);
+    defer caller.deinit();
+    const caller_port = caller.socket.address.ip4.port;
+    var callee = try transport.UdpSocket.init(io, 0);
+    defer callee.deinit();
+    const callee_port = callee.socket.address.ip4.port;
+
+    const loopback = std.Io.net.Ip4Address.loopback(0).bytes;
+    const caller_ip = std.Io.net.IpAddress{ .ip4 = .{ .bytes = loopback, .port = 0 } };
+    const callee_ip = std.Io.net.IpAddress{ .ip4 = .{ .bytes = loopback, .port = 0 } };
+
+    _ = try sessions.createSession("call-e2e", caller_port, caller_ip, 0);
+    sessions.setCallee("call-e2e", callee_ip, callee_port, 0);
+
+    // Open relay sockets the way onAck does.
+    const session = sessions.getSession("call-e2e").?;
+    session.caller_sock = try transport.UdpSocket.init(io, session.relay_caller_port);
+    session.callee_sock = try transport.UdpSocket.init(io, session.relay_callee_port);
+
+    // Stands in for the SIP socket: source of relayed sends.
+    var out = try transport.UdpSocket.init(io, 0);
+    defer out.deinit();
+
+    var rtp_buf: [256]u8 = undefined;
+    var recv_buf: [256]u8 = undefined;
+    const pkt1 = [_]u8{ 0x80, 0x00, 0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 7, 0xAA, 0xBB };
+    const pkt2 = [_]u8{ 0x80, 0x08, 0x56, 0x78, 0, 0, 0, 2, 0, 0, 0, 9, 0xCC, 0xDD };
+
+    // Caller -> relay -> callee.
+    try caller.sendTo(&pkt1, .{ .ip4 = std.Io.net.Ip4Address.loopback(session.relay_caller_port) });
+    sessions.drain(&out, &rtp_buf);
+    const got1 = try callee.recvFromTimeout(&recv_buf, transport.timeoutMs(2000));
+    try std.testing.expectEqualStrings(&pkt1, got1.data);
+
+    // Callee -> relay -> caller.
+    try callee.sendTo(&pkt2, .{ .ip4 = std.Io.net.Ip4Address.loopback(session.relay_callee_port) });
+    sessions.drain(&out, &rtp_buf);
+    const got2 = try caller.recvFromTimeout(&recv_buf, transport.timeoutMs(2000));
+    try std.testing.expectEqualStrings(&pkt2, got2.data);
 }

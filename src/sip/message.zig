@@ -71,6 +71,7 @@ pub const Request = struct {
     expires: ?u32,
     content_type: ?[]const u8,
     max_forwards: ?u32,
+    authorization: ?[]const u8,
     body: []const u8,
 };
 

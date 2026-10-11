@@ -142,6 +142,27 @@ pub const Registrar = struct {
         return null;
     }
 
+    /// Reaps expired contacts without waiting for a lookup. Returns the
+    /// number of entries removed. Same frees as the lazy eviction paths.
+    pub fn sweepExpired(self: *Registrar) usize {
+        const now = std.Io.Timestamp.now(self.io, std.Io.Clock.real).toSeconds();
+        var removed: usize = 0;
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.expires_at < now) {
+                const key = entry.key_ptr.*;
+                const call_id = entry.value_ptr.call_id;
+                _ = self.map.remove(key);
+
+                self.allocator.free(key);
+                self.allocator.free(call_id);
+                removed += 1;
+                it = self.map.iterator();
+            }
+        }
+        return removed;
+    }
+
     pub fn unregister(self: *Registrar, aor: []const u8) void {
         if (self.map.fetchRemove(aor)) |kv| {
             self.allocator.free(kv.key);
@@ -254,4 +275,21 @@ test "lookup by username works across different domains" {
     const found2 = registrar.lookup("sip:alice");
     try std.testing.expect(found2 != null);
     try std.testing.expectEqual(addr, found2.?.address);
+}
+
+test "sweepExpired reaps without a lookup" {
+    const io = std.testing.io;
+    var registrar = Registrar.init(std.testing.allocator, io);
+    defer registrar.deinit();
+
+    const addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 5 }, .port = 5060 } };
+    try registrar.register("sip:temp@pbx.local", addr, 1, "callid1", 1);
+    try std.testing.expectEqual(@as(usize, 2), registrar.map.count());
+
+    // Second-granularity expiry needs a full 2s (mirrors the e2e test).
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(2100), .real) catch unreachable;
+
+    // Both the AOR and username-twin entries are reaped (no lookup needed).
+    try std.testing.expectEqual(@as(usize, 2), registrar.sweepExpired());
+    try std.testing.expectEqual(@as(usize, 0), registrar.map.count());
 }

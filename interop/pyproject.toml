@@ -1,0 +1,11 @@
+[project]
+name = "micro-pbx-interop"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+markers = ["slow: Timer-B and other long scenarios (~40s each)"]

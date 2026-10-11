@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- Caller side for callee-BYE: identical to uac-alice-call.xml through the
+     ACK (no duplicate-INVITE storm here), then the caller waits for the
+     callee's BYE and answers 200 instead of hanging up itself. -->
+<scenario name="pbx-caller-callee-bye">
+  <send retrans="500">
+    <![CDATA[
+      INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/UDP [local_ip]:[local_port];branch=z9hG4bKsipp-alice-inv2
+      Max-Forwards: 70
+      From: <sip:alice@[remote_ip]:[remote_port]>;tag=sippalice2
+      To: <sip:bob@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:alice@[local_ip]:[local_port]>
+      Content-Type: application/sdp
+      Content-Length: 95
+
+      v=0
+      o=alice 12345 67890 IN IP4 127.0.0.1
+      s=sipp
+      c=IN IP4 127.0.0.1
+      m=audio 20000 RTP/AVP 0
+
+    ]]>
+  </send>
+
+  <recv response="100" timeout="8000">
+  </recv>
+
+  <recv response="180" timeout="8000">
+  </recv>
+
+  <recv response="200" timeout="8000">
+  </recv>
+
+  <send>
+    <![CDATA[
+      ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/UDP [local_ip]:[local_port];branch=z9hG4bKsipp-alice-ack2
+      Max-Forwards: 70
+      From: <sip:alice@[remote_ip]:[remote_port]>;tag=sippalice2
+      To: <sip:bob@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Callee hangs up: wait for their BYE with NO preceding pause. A pause
+       here races the UAS's own post-ACK pause (both ~500ms): if the BYE wins
+       by milliseconds sipp aborts on "unexpected BYE". recv arms immediately
+       after the ACK, strictly before the BYE can exist (the UAS only sends
+       it after receiving that ACK). -->
+  <recv request="BYE" timeout="15000">
+  </recv>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <pause milliseconds="500"/>
+
+  <!-- End of call. -->
+</scenario>
