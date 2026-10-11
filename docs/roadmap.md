@@ -5,16 +5,16 @@ done. Last reviewed: 2026-10-11 (all items open).
 
 ## Protocol features
 
-### Re-INVITE / hold-resume / session timers
-Mid-dialog INVITEs are not renegotiated today (same-branch duplicates are
-absorbed silently with no re-forward; see
-`test_s4_call_and_s5_absorb`).
-Codec changes, hold/resume, and `Session-Expires` refreshes need new
-handling. Doing this touches `onInvite` (`src/pbx.zig:274`), the dialog
-`invite_txn` slot (`src/call.zig:38`), and the RTP session media ports.
-Verify with a new interop test: in-dialog re-INVITE with altered SDP →
-200 with fresh anchored SDP → media flows to the new port. Approach:
-add the test `xfail` first to characterize current behavior, flip on landing.
+### Re-INVITE / hold-resume / session timers — caller-initiated done
+Established dialogs with a higher CSeq renegotiate: re-forward with fresh
+PBX branch (no 100), caller media endpoint updated in place (relay
+ports/sockets stay), 200s answered in established state without flipping
+it, re-leg Timer-B 408s without tearing down the dialog (branch compared
+against the preserved original). Covered by 6 unit tests + live
+`test_s10_reinvite` (port move 20000→20002, echo loop follows). Still open:
+hold (`0.0.0.0`/inactive) semantics, callee-initiated port changes (sipp
+binds one media port), `Session-Expires` timers, CANCEL of a pending
+re-leg (gets whatever established-CANCEL gets today).
 
 ### INVITE-time authentication — done (verified unit + live)
 `onInvite` challenges before lookup (`src/pbx.zig`, same

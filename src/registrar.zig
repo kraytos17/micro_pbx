@@ -5,6 +5,18 @@ const std = @import("std");
 const log = std.log.scoped(.registrar);
 
 /// Returns the username portion of an AOR, or null if it lacks a `sip:` prefix.
+/// Builds the "sip:{user}" dual-key lookup key: stack buffer fast path
+/// (usernames all fit), heap fallback past 256 bytes. Caller frees
+/// result iff owned. Null means OOM.
+fn usernameKey(allocator: std.mem.Allocator, username: []const u8, buf: *[256]u8) ?struct { key: []const u8, owned: bool } {
+    if (std.fmt.bufPrint(buf, "sip:{s}", .{username})) |key| {
+        return .{ .key = key, .owned = false };
+    } else |_| {
+        const heap_key = allocator.print("sip:{s}", .{username}) catch return null;
+        return .{ .key = heap_key, .owned = true };
+    }
+}
+
 pub fn extractUsername(aor: []const u8) ?[]const u8 {
     const sip_prefix = "sip:";
     if (!std.mem.startsWith(u8, aor, sip_prefix)) {
@@ -125,9 +137,11 @@ pub const Registrar = struct {
             return entry;
         }
         if (extractUsername(aor)) |username| {
-            const username_key = self.allocator.print("sip:{s}", .{username}) catch return null;
-            defer self.allocator.free(username_key);
+            var key_buf: [256]u8 = undefined;
+            const k = usernameKey(self.allocator, username, &key_buf) orelse return null;
+            defer if (k.owned) self.allocator.free(k.key);
 
+            const username_key = k.key;
             if (self.map.get(username_key)) |entry| {
                 if (now > entry.expires_at) {
                     if (self.map.fetchRemove(username_key)) |kv| {
@@ -169,8 +183,11 @@ pub const Registrar = struct {
             self.allocator.free(kv.value.call_id);
         }
         if (extractUsername(aor)) |username| {
-            const username_key = self.allocator.print("sip:{s}", .{username}) catch return;
-            defer self.allocator.free(username_key);
+            var key_buf: [256]u8 = undefined;
+            const k = usernameKey(self.allocator, username, &key_buf) orelse return;
+            defer if (k.owned) self.allocator.free(k.key);
+
+            const username_key = k.key;
             if (self.map.fetchRemove(username_key)) |kv| {
                 self.allocator.free(kv.key);
                 self.allocator.free(kv.value.call_id);
@@ -291,5 +308,21 @@ test "sweepExpired reaps without a lookup" {
 
     // Both the AOR and username-twin entries are reaped (no lookup needed).
     try std.testing.expectEqual(@as(usize, 2), registrar.sweepExpired());
+    try std.testing.expectEqual(@as(usize, 0), registrar.map.count());
+}
+
+test "absurd username falls back to heap key" {
+    var registrar = Registrar.init(std.testing.allocator, std.testing.io);
+    defer registrar.deinit();
+
+    // 300-char username: stack buffer (256) can't hold "sip:{user}".
+    // Lookup + unregister must still work (heap fallback), leak-free
+    // under the SafeAllocator suite.
+    var long_user: [300]u8 = undefined;
+    @memset(&long_user, 'x');
+    var aor_buf: [360]u8 = undefined;
+    const aor = std.fmt.bufPrint(&aor_buf, "sip:{s}@127.0.0.1:5060", .{long_user}) catch unreachable;
+    try std.testing.expect(registrar.lookup(aor) == null);
+    registrar.unregister(aor);
     try std.testing.expectEqual(@as(usize, 0), registrar.map.count());
 }

@@ -26,8 +26,8 @@ from register import digest_response, parse_www_auth
 
 
 def build_invite(user, callee, branch, call_id, cseq, contact_port, from_tag,
-                 to_tag=None, auth=None, sdp=True, host="127.0.0.1",
-                 pbx_port=5060):
+                 to_tag=None, auth=None, sdp=True, sdp_port=20000,
+                 host="127.0.0.1", pbx_port=5060):
     to = f"<sip:{callee}@{host}:{pbx_port}>" + (f";tag={to_tag}" if to_tag else "")
     lines = [
         f"INVITE sip:{callee}@{host}:{pbx_port} SIP/2.0",
@@ -43,8 +43,8 @@ def build_invite(user, callee, branch, call_id, cseq, contact_port, from_tag,
         lines.append(f"Authorization: {auth}")
     body = ""
     if sdp:
-        body = ("\r\nv=0\r\no=caller 12345 67890 IN IP4 127.0.0.1\r\n"
-                "s=pytest\r\nc=IN IP4 127.0.0.1\r\nm=audio 20000 RTP/AVP 0\r\n")
+        body = (f"\r\nv=0\r\no=caller 12345 67890 IN IP4 127.0.0.1\r\n"
+                f"s=pytest\r\nc=IN IP4 127.0.0.1\r\nm=audio {sdp_port} RTP/AVP 0\r\n")
         lines.append("Content-Type: application/sdp")
     lines.append(f"Content-Length: {len(body)}")
     return ("\r\n".join(lines) + "\r\n\r\n" + body).encode()
@@ -174,8 +174,8 @@ class Dialog:
         """
         uri = f"sip:{callee}@{self.host}:{self.pbx_port}"
         self._send(build_invite(self.user, callee, branch, call_id, 1,
-                                self.port, from_tag, None, None, True,
-                                self.host, self.pbx_port))
+                                self.port, from_tag, host=self.host,
+                                pbx_port=self.pbx_port))
         msg = self._recv()
         status = msg.split("\r\n", 1)[0]
         if not status.startswith("SIP/2.0 401"):
@@ -188,7 +188,7 @@ class Dialog:
                                "INVITE", uri, False)
         authed = build_invite(self.user, callee, branch + "-auth", call_id,
                                2, self.port, from_tag, None, auth, True,
-                               self.host, self.pbx_port)
+                               20000, self.host, self.pbx_port)
         self._send(authed)
         self.last_invite = authed
         self._expect("SIP/2.0 100", "100 Trying")
@@ -216,7 +216,7 @@ class Dialog:
         uri = f"sip:{callee}@{self.host}:{self.pbx_port}"
         self._send(build_invite(self.user, callee, branch, call_id, 1,
                                 self.port, from_tag, None, None, False,
-                                self.host, self.pbx_port))
+                                20000, self.host, self.pbx_port))
         msg = self._recv()
         status = msg.split("\r\n", 1)[0]
         if not status.startswith("SIP/2.0 401"):
@@ -229,7 +229,7 @@ class Dialog:
                                "INVITE", uri, False)
         authed = build_invite(self.user, callee, branch + "-auth", call_id,
                                2, self.port, from_tag, None, auth, False,
-                               self.host, self.pbx_port)
+                               20000, self.host, self.pbx_port)
         self._send(authed)
         self.last_invite = authed
         msg = self._recv()
@@ -271,6 +271,17 @@ class Dialog:
         if self.last_invite is None:
             raise InviteError("no INVITE sent yet")
         self._send(self.last_invite)
+
+    def reinvite(self, callee, call_id, from_tag, to_tag, new_sdp_port,
+                 invite_cseq=3, branch="z9hG4bKpyreinv"):
+        """Bare in-dialog re-INVITE with a new SDP offer. Established legs
+        ride the authenticated dialog, so no credentials are attached.
+        Returns the 200 message."""
+        self._send(build_invite(self.user, callee, branch, call_id,
+                                invite_cseq, self.port, from_tag, to_tag,
+                                None, True, new_sdp_port, self.host,
+                                self.pbx_port))
+        return self._expect("SIP/2.0 200", "200 for re-INVITE")
 
     def ack(self, callee, call_id, from_tag, to_tag, invite_cseq,
             branch="z9hG4bKpyack"):
@@ -357,7 +368,7 @@ def bare_invite_status(user, callee, port, timeout=5, host="127.0.0.1",
     try:
         sock.sendto(build_invite(user, callee, "z9hG4bKpybareinv",
                                  f"pybareinv-{user}", 1, port, "pytag",
-                                 None, None, False, host, pbx_port),
+                                 None, None, False, 20000, host, pbx_port),
                      (host, pbx_port))
         try:
             data, _ = sock.recvfrom(4096)

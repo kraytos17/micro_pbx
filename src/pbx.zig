@@ -58,6 +58,11 @@ pub const Pbx = struct {
         };
 
         errdefer self.deinit();
+        // Presize tables to their caps: insertions up to the caps never
+        // reallocate, so floods can't buy rehash pauses at the worst time.
+        try self.calls.ensureTotalCapacity(call.max_dialogs);
+        try self.txn_layer.map.ensureTotalCapacity(txn.max_transactions);
+        try self.auth.nonces.ensureTotalCapacity(auth.max_nonces);
         // Fallback credential store (main loads users.conf over these when
         // present). Passwords must match interop/register.py's credentials.
         try self.auth.addUser("alice", "alicepass");
@@ -172,7 +177,7 @@ pub const Pbx = struct {
         from: std.Io.net.IpAddress,
         resp_buf: []u8,
     ) !void {
-        try proxy.handleRegister(req, from, &self.reg, &self.auth, &self.socket, resp_buf, self.allocator);
+        try proxy.handleRegister(req, from, &self.reg, &self.auth, &self.socket, resp_buf);
     }
 
     /// Timer pass: resends every firing transaction request, then frees
@@ -236,30 +241,59 @@ pub const Pbx = struct {
         while (it.next()) |kv| {
             const dlg = kv.value_ptr;
             const call_ctx = &dlg.call;
-            const invite_branch = call_ctx.invite_branch orelse continue;
-            if (!std.mem.eql(u8, invite_branch, branch)) continue;
-
             const call_id = kv.key_ptr.*;
             var resp_buf: [2048]u8 = undefined;
-            const timeout_resp = proxy.buildTimeoutResponse(
-                &resp_buf,
-                call_id,
-                call_ctx.invite_cseq,
-                call_ctx.caller_via orelse "",
-                call_ctx.caller_from orelse "",
-                call_ctx.caller_to orelse "",
-            ) catch |err| {
-                log.err("buildTimeoutResponse failed: {}", .{err});
-                return;
-            };
+            if (call_ctx.invite_branch) |invite_branch| {
+                if (std.mem.eql(u8, invite_branch, branch)) {
+                    const timeout_resp = proxy.buildTimeoutResponse(
+                        &resp_buf,
+                        call_id,
+                        call_ctx.invite_cseq,
+                        call_ctx.caller_via orelse "",
+                        call_ctx.caller_from orelse "",
+                        call_ctx.caller_to orelse "",
+                    ) catch |err| {
+                        log.err("buildTimeoutResponse failed: {}", .{err});
+                        return;
+                    };
 
-            self.socket.sendTo(timeout_resp, call_ctx.caller_addr) catch |err| {
-                log.err("send 408 to caller failed: {}", .{err});
-            };
+                    self.socket.sendTo(timeout_resp, call_ctx.caller_addr) catch |err| {
+                        log.err("send 408 to caller failed: {}", .{err});
+                    };
 
-            log.info("call {s} terminated (408 Request Timeout)", .{call_id});
-            call.removeCall(&self.calls, self.allocator, call_id);
-            return;
+                    log.info("call {s} terminated (408 Request Timeout)", .{call_id});
+                    call.removeCall(&self.calls, self.allocator, call_id);
+                    return;
+                }
+            }
+            // Re-leg expiry: the branch matches the pending re-INVITE
+            // transaction, not the original leg. 408 the attempt, complete
+            // the transaction — the established dialog survives (tearing it
+            // down over one unanswered re-INVITE would be wrong).
+            if (dlg.invite_txn) |*t| {
+                if (std.mem.eql(u8, t.id.branch, branch)) {
+                    const via = call_ctx.reinvite_via orelse continue;
+                    const timeout_resp = proxy.buildTimeoutResponse(
+                        &resp_buf,
+                        call_id,
+                        call_ctx.invite_cseq,
+                        via,
+                        call_ctx.reinvite_from orelse "",
+                        call_ctx.reinvite_to orelse "",
+                    ) catch |err| {
+                        log.err("buildTimeoutResponse failed: {}", .{err});
+                        return;
+                    };
+
+                    self.socket.sendTo(timeout_resp, call_ctx.caller_addr) catch |err| {
+                        log.err("send 408 to caller failed: {}", .{err});
+                    };
+
+                    log.info("call {s} re-INVITE timed out (408), dialog kept", .{call_id});
+                    dlg.completeInviteTxn(std.Io.Timestamp.now(self.io, std.Io.Clock.real).toMilliseconds());
+                    return;
+                }
+            }
         }
     }
 
@@ -331,7 +365,7 @@ pub const Pbx = struct {
             const username = self.auth.verifyRequest(req) catch |err| {
                 const stale = err == error.StaleNonce;
                 if (stale) log.info("stale nonce for {s}, re-challenging", .{req.request_uri});
-                try proxy.sendUnauthorized(&self.socket, from, &self.auth, resp_buf, req, self.allocator, stale);
+                try proxy.sendUnauthorized(&self.socket, from, &self.auth, resp_buf, req, stale);
                 return;
             };
 
@@ -339,13 +373,13 @@ pub const Pbx = struct {
             const dest_aor = proxy.extractUri(req.request_uri);
             const contact = self.reg.lookup(dest_aor) orelse {
                 log.warn("INVITE {s} not found, sending 404", .{dest_aor});
+                // Build once into resp_buf: the same bytes go out on the
+                // wire and into the retransmit cache (top Via echoed
+                // unchanged). Previously built twice (buildResponse for
+                // the cache plus sendResponseWithBranch re-emitting).
+                const response_404 = try proxy.buildResponse(resp_buf, 404, "Not Found", req, null);
 
-                // Build 404 response (top Via echoed unchanged)
-                var response_buf: [2048]u8 = undefined;
-                const response_404 = try proxy.buildResponse(&response_buf, 404, "Not Found", req, null);
-
-                // Send the 404
-                try proxy.sendResponseWithBranch(&self.socket, from, resp_buf, 404, "Not Found", req);
+                try self.socket.sendTo(response_404, from);
                 // Cache the 404 response for retransmissions using client's branch.
                 // Under table pressure the 404 already went out; only the
                 // cache entry is skipped (storeResponse no-ops on a miss).
@@ -380,7 +414,8 @@ pub const Pbx = struct {
                 }
             }
 
-            const invite_result = try proxy.handleInvite(invite_req, from, contact, &self.socket, self.pbx_addr, resp_buf, fwd_buf, arena, self.io);
+            var branch_buf: [32]u8 = undefined;
+            const invite_result = try proxy.handleInvite(invite_req, from, contact, &self.socket, self.pbx_addr, resp_buf, fwd_buf, &branch_buf, self.io);
 
             // Ensure the dialog (dlg_ptr may have dangled across a rehash;
             // use dlg2 below, never dlg_ptr past this point).
@@ -403,14 +438,82 @@ pub const Pbx = struct {
             ctx.caller_from = dialog_alloc.dupe(u8, req.from) catch null;
             ctx.caller_to = dialog_alloc.dupe(u8, req.to) catch null;
             ctx.invite_cseq = req.cseq_num;
-            // invite_result.branch lives in scratch (reset per iteration).
+            // invite_result.branch borrows our branch_buf above; the arena
+            // dupes (txn + invite_branch) already hold copies past return.
         } else {
+            // Established dialog, higher CSeq: caller-initiated re-INVITE
+            // renegotiation (new SDP offer). Everything else absorbs
+            // silently exactly as before: same-branch duplicates, stale
+            // CSeq, pre-answer retries. No auth here either — the re-leg
+            // rides the authenticated dialog, like BYE.
+            if (dlg_ptr) |dlg| {
+                if (dlg.call.state == .established and req.cseq_num > dlg.call.invite_cseq) {
+                    self.forwardReinvite(dlg, req.call_id, req, from, fwd_buf) catch |err| {
+                        log.err("forwardReinvite error: {}", .{err});
+                    };
+                    return;
+                }
+            }
             // Duplicate or in-dialog INVITE (call already tracked): absorb
             // silently. Re-100ing feeds retransmit storms — real stacks keep
             // Timer A running past provisionals — and risks aborting strict
             // UAs with out-of-step responses.
             log.debug("absorbed duplicate INVITE {s} branch {s}", .{ req.call_id, req.via_branch });
         }
+    }
+
+    /// Forwards a caller-initiated re-INVITE on an established dialog: new
+    /// SDP offer, same relay session (ports/sockets stay), fresh PBX branch,
+    /// no 100 (absorb-philosophy minimalism). Caller media endpoint moves
+    /// now — the UAC sends from the new port as soon as the offer goes out.
+    /// invite_branch keeps the ORIGINAL leg (Timer-B identity);
+    /// invite_cseq advances so future absorbs distinguish stale retries.
+    /// The client transaction reuses the (free) invite slot for Timer A/B.
+    fn forwardReinvite(self: *Pbx, dlg: *call.Dialog, call_id: []const u8, req: msg.Request, from: std.Io.net.IpAddress, fwd_buf: []u8) !void {
+        const call_ctx = &dlg.call;
+        const arena = self.scratch.allocator();
+        const callee = call_ctx.callee_contact_addr orelse {
+            log.warn("re-INVITE for call with no callee contact", .{});
+            return;
+        };
+
+        var invite_req = req;
+        if (req.content_type) |ct| {
+            if (std.mem.eql(u8, ct, "application/sdp") and req.body.len > 0) {
+                if (sdp.parseSdp(req.body)) |media| {
+                    if (self.rtp_sessions.getSession(call_id)) |session| {
+                        self.rtp_sessions.setCaller(call_id, from, media.port, media.payload_type);
+                        invite_req.body = try sdp.rewriteSdp(req.body, "127.0.0.1", session.relay_callee_port, arena);
+                    } else {
+                        const session = try self.rtp_sessions.createSession(call_id, media.port, from, media.payload_type);
+                        invite_req.body = try sdp.rewriteSdp(req.body, "127.0.0.1", session.relay_callee_port, arena);
+                    }
+                } else |_| {
+                    log.warn("could not parse caller SDP in re-INVITE", .{});
+                }
+            }
+        }
+
+        var branch_buf: [32]u8 = undefined;
+        const branch = proxy.generateBranch(&branch_buf, self.io);
+        const forwarded = try proxy.buildForwardedRequest(invite_req, self.pbx_addr, branch, fwd_buf);
+
+        try self.socket.sendTo(forwarded, callee);
+        const now_ms = std.Io.Timestamp.now(self.io, std.Io.Clock.real).toMilliseconds();
+
+        dlg.completeInviteTxn(now_ms);
+        if (txn.makeTransaction(dlg.arena.allocator(), now_ms, branch, .INVITE, .invite, forwarded, callee)) |t| {
+            dlg.invite_txn = t;
+        } else |err| {
+            log.warn("untracked re-INVITE leg under pressure: {}", .{err});
+        }
+
+        const dialog_alloc = dlg.arena.allocator();
+        call_ctx.reinvite_via = dialog_alloc.dupe(u8, req.via) catch null;
+        call_ctx.reinvite_from = dialog_alloc.dupe(u8, req.from) catch null;
+        call_ctx.reinvite_to = dialog_alloc.dupe(u8, req.to) catch null;
+        call_ctx.invite_cseq = req.cseq_num;
+        log.info("call {s} re-INVITE forwarded (CSeq {d})", .{ call_id, req.cseq_num });
     }
 
     fn onAck(
@@ -427,23 +530,28 @@ pub const Pbx = struct {
             }
 
             const dest_addr = call_ctx.callee_contact_addr orelse call_ctx.caller_addr;
-            const branch = try proxy.generateBranch(self.allocator, self.io);
-            defer self.allocator.free(branch);
+            var branch_buf: [32]u8 = undefined;
+            const branch = proxy.generateBranch(&branch_buf, self.io);
             proxy.handleAck(req, dest_addr, &self.reg, &self.socket, self.pbx_addr, branch, fwd_buf) catch |err| {
                 log.err("handleAck error: {}", .{err});
             };
 
             if (self.rtp_sessions.getSession(req.call_id)) |session| {
-                if (transport.UdpSocket.init(self.io, session.relay_caller_port)) |sock| {
-                    session.caller_sock = sock;
-                } else |err| {
-                    log.err("caller relay socket failed: {}", .{err});
+                // Open once: re-INVITE ACKs must not rebind held ports
+                // (bind fails, err-logs, and trips test_no_errors).
+                if (session.caller_sock == null) {
+                    if (transport.UdpSocket.init(self.io, session.relay_caller_port)) |sock| {
+                        session.caller_sock = sock;
+                    } else |err| {
+                        log.err("caller relay socket failed: {}", .{err});
+                    }
                 }
-
-                if (transport.UdpSocket.init(self.io, session.relay_callee_port)) |sock| {
-                    session.callee_sock = sock;
-                } else |err| {
-                    log.err("callee relay socket failed: {}", .{err});
+                if (session.callee_sock == null) {
+                    if (transport.UdpSocket.init(self.io, session.relay_callee_port)) |sock| {
+                        session.callee_sock = sock;
+                    } else |err| {
+                        log.err("callee relay socket failed: {}", .{err});
+                    }
                 }
             }
         } else {
@@ -459,9 +567,8 @@ pub const Pbx = struct {
         from: std.Io.net.IpAddress,
         fwd_buf: []u8,
     ) !void {
-        const branch = try proxy.generateBranch(self.allocator, self.io);
-        defer self.allocator.free(branch);
-
+        var branch_buf: [32]u8 = undefined;
+        const branch = proxy.generateBranch(&branch_buf, self.io);
         if (self.calls.getPtr(req.call_id)) |dlg| {
             const call_ctx = &dlg.call;
             const is_from_caller = call.addressEqual(from, call_ctx.caller_addr);
@@ -613,6 +720,19 @@ pub const Pbx = struct {
                                 log.err("handleResponse 2xx race: {}", .{err});
                             };
                             dlg.invite_txn = null;
+                        } else if (call_ctx.state == .established) {
+                            // Answer to a re-INVITE: forward to the caller and
+                            // record the (possibly new) callee endpoint, but
+                            // keep established state — no flip, no teardown
+                            // of the dialog. The re-leg transaction completes
+                            // (Timer D sweep, no spurious post-answer 408).
+                            log.info("call {s} re-INVITE answered ({d} {s})", .{ resp.call_id, resp.status_code, resp.reason_phrase });
+                            call_ctx.callee_resp_addr = from;
+                            proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
+                                log.err("handleResponse re-invite: {}", .{err});
+                            };
+
+                            dlg.completeInviteTxn(std.Io.Timestamp.now(self.io, std.Io.Clock.real).toMilliseconds());
                         }
                     } else {
                         // In-dialog non-INVITE responses travel the request
@@ -1563,6 +1683,245 @@ test "e2e rejected callee-BYE routes to callee and removes dialog" {
     try std.testing.expectEqual(txns_before, server.txn_layer.map.count());
 }
 
+/// Establishes alice→bob through 200+ACK (CSeq 1 throughout) for
+/// re-INVITE tests. Bob's contact is the given address (ephemeral socket
+/// for wire-visible forwards, or test_bob_addr for state-only asserts).
+fn establishDialog(server: *Pbx, call_id: []const u8, bob_addr: std.Io.net.IpAddress, with_sdp: bool, resp_buf: []u8, fwd_buf: []u8) !void {
+    try registerUser(server, "alice", test_alice_addr, resp_buf);
+    try registerHandshake(server, "bob", "bobpass", bob_addr, resp_buf, "bobreg@127.0.0.1", 1, 3600);
+    try inviteHandshake(server, call_id, "z9hG4bKestab", test_alice_addr, with_sdp, resp_buf, fwd_buf);
+    var raw_buf: [2048]u8 = undefined;
+    const ok_raw = try std.fmt.bufPrint(&raw_buf, "SIP/2.0 200 OK\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKestabresp\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: {s}\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", .{call_id});
+    try deliverResponse(server, ok_raw, bob_addr, fwd_buf);
+    const ack_raw = try std.fmt.bufPrint(&raw_buf, "ACK sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKestaback\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: {s}\r\n" ++
+        "CSeq: 1 ACK\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", .{call_id});
+    const ack_req = try parseRequest(ack_raw);
+    try server.onAck(ack_req, test_alice_addr, fwd_buf);
+}
+
+test "e2e re-INVITE established forwards and updates caller leg" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var bob_sock = try transport.UdpSocket.init(std.testing.io, 0);
+    defer bob_sock.deinit();
+    const bob_addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address.loopback(bob_sock.socket.address.ip4.port) };
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    const call_id = "call-reinvite";
+    try establishDialog(&server, call_id, bob_addr, true, &resp_buf, &fwd_buf);
+    {
+        // Drain handshake traffic (401+200 for bob's REGISTER, forwarded
+        // INVITE, forwarded ACK): the next read must be the re-INVITE.
+        var drain_buf: [2048]u8 = undefined;
+        _ = try bob_sock.recvFromTimeout(&drain_buf, transport.timeoutMs(2000));
+        _ = try bob_sock.recvFromTimeout(&drain_buf, transport.timeoutMs(2000));
+        _ = try bob_sock.recvFromTimeout(&drain_buf, transport.timeoutMs(2000));
+        _ = try bob_sock.recvFromTimeout(&drain_buf, transport.timeoutMs(2000));
+    }
+    const orig_branch = try std.testing.allocator.dupe(u8, server.calls.get(call_id).?.call.invite_branch.?);
+    defer std.testing.allocator.free(orig_branch);
+
+    // Re-INVITE, new branch + CSeq, new caller SDP port. Bare (no
+    // Authorization): established legs ride the authenticated dialog.
+    const re_req = try parseRequest("INVITE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKreinv3\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-reinvite\r\n" ++
+        "CSeq: 3 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "Content-Type: application/sdp\r\n" ++
+        "Content-Length: 95\r\n" ++
+        "\r\n" ++
+        "v=0\r\no=alice 12345 67890 IN IP4 127.0.0.1\r\ns=sipp\r\nc=IN IP4 127.0.0.1\r\nm=audio 20002 RTP/AVP 0\r\n");
+    try server.onInvite(re_req, test_alice_addr, &resp_buf, &fwd_buf);
+
+    // Forwarded to the callee with PBX-rewritten SDP (callee leg keeps
+    // the session's relay ports)...
+    var recv_buf: [2048]u8 = undefined;
+    const got = try bob_sock.recvFromTimeout(&recv_buf, transport.timeoutMs(2000));
+    try std.testing.expect(std.mem.find(u8, got.data, "CSeq: 3 INVITE") != null);
+    try std.testing.expect(std.mem.find(u8, got.data, "m=audio 20002") == null);
+    try std.testing.expect(std.mem.find(u8, got.data, "m=audio 10002") != null);
+    // ...dialog intact and established, Timer-B identity preserved, CSeq
+    // advanced, caller leg moved, re-leg tracked for timers.
+    const dlg = server.calls.getPtr(call_id).?;
+    try std.testing.expect(dlg.call.state == .established);
+    try std.testing.expectEqualStrings(orig_branch, dlg.call.invite_branch.?);
+    try std.testing.expectEqual(@as(u32, 3), dlg.call.invite_cseq);
+    try std.testing.expect(dlg.invite_txn != null);
+    const session = server.rtp_sessions.getSession(call_id).?;
+    try std.testing.expectEqual(@as(u16, 20002), session.caller_rtp_port);
+}
+
+test "e2e established same-branch duplicate absorbs" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    const call_id = "call-redup";
+    try establishDialog(&server, call_id, test_bob_addr, false, &resp_buf, &fwd_buf);
+    const cseq_before = server.calls.get(call_id).?.call.invite_cseq;
+
+    // Same branch AND CSeq as the answered INVITE, junk auth that would 401
+    // if it ever reached verification: must absorb silently.
+    const dup = try parseRequest("INVITE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKestab\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-redup\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "Authorization: Digest username=\"alice\", response=\"junk\"\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onInvite(dup, test_alice_addr, &resp_buf, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id).?.call.state == .established);
+    try std.testing.expectEqual(cseq_before, server.calls.get(call_id).?.call.invite_cseq);
+}
+
+test "e2e established stale-CSeq new-branch absorbs" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    const call_id = "call-restale";
+    try establishDialog(&server, call_id, test_bob_addr, false, &resp_buf, &fwd_buf);
+
+    // New branch but CSeq back at 1 (below the answered leg): no new offer,
+    // absorb rather than inventing a response path for it.
+    const stale = try parseRequest("INVITE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKrestale\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-restale\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onInvite(stale, test_alice_addr, &resp_buf, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id).?.call.state == .established);
+    try std.testing.expectEqual(@as(u32, 1), server.calls.get(call_id).?.call.invite_cseq);
+}
+
+test "e2e 200-to-reinvite keeps established, completes txn" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    const call_id = "call-re200";
+    try establishDialog(&server, call_id, test_bob_addr, false, &resp_buf, &fwd_buf);
+
+    // Drive a re-INVITE through the test-only forward path helper state:
+    // emulate by direct forwardReinvite via a parsed re-INVITE.
+    const re_req = try parseRequest("INVITE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKre200\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-re200\r\n" ++
+        "CSeq: 3 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onInvite(re_req, test_alice_addr, &resp_buf, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id).?.invite_txn != null);
+
+    // Callee answers the re-INVITE: forwarded to caller, callee endpoint
+    // refreshed, state stays established, txn completed (no phantom 408).
+    try deliverResponse(&server, "SIP/2.0 200 OK\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKre200resp\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-re200\r\n" ++
+        "CSeq: 3 INVITE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", test_bob_addr, &fwd_buf);
+    const dlg = server.calls.getPtr(call_id).?;
+    try std.testing.expect(dlg.call.state == .established);
+    try std.testing.expect(dlg.invite_txn.?.state == .completed);
+}
+
+test "e2e re-leg Timer-B 408s without teardown" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    const call_id = "call-retimeout";
+    try establishDialog(&server, call_id, test_bob_addr, false, &resp_buf, &fwd_buf);
+
+    const re_req = try parseRequest("INVITE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKretimeout\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-retimeout\r\n" ++
+        "CSeq: 3 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onInvite(re_req, test_alice_addr, &resp_buf, &fwd_buf);
+
+    // Backdate the re-leg transaction past 64*T1 and force it overdue.
+    const dlg = server.calls.getPtr(call_id).?;
+    if (dlg.invite_txn) |*t| {
+        const now_ms = std.Io.Timestamp.now(std.testing.io, std.Io.Clock.real).toMilliseconds();
+        t.created_at_ms = now_ms - txn.timer_b_ms - 1;
+        t.next_fire_at_ms = 0;
+    }
+
+    server.handleTimeout();
+
+    // 408 went out for the re-leg, but the established dialog survives —
+    // tearing it down over one unanswered re-INVITE would be wrong.
+    try std.testing.expect(server.calls.get(call_id) != null);
+    try std.testing.expect(server.calls.get(call_id).?.call.state == .established);
+}
+
+test "e2e re-INVITE without SDP forwards unchanged" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    const call_id = "call-renosdp";
+    try establishDialog(&server, call_id, test_bob_addr, false, &resp_buf, &fwd_buf);
+    const session_before = server.rtp_sessions.getSession(call_id);
+    try std.testing.expect(session_before == null);
+
+    const re_req = try parseRequest("INVITE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKrenosdp\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-renosdp\r\n" ++
+        "CSeq: 3 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onInvite(re_req, test_alice_addr, &resp_buf, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id).?.call.state == .established);
+    try std.testing.expectEqual(@as(u32, 3), server.calls.get(call_id).?.call.invite_cseq);
+    // Still no session: re-INVITEs without SDP must not conjure one.
+    try std.testing.expect(server.rtp_sessions.getSession(call_id) == null);
+}
+
 test "e2e forwarded INVITE carries PBX-rewritten SDP" {
     var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
     defer server.deinit();
@@ -1717,4 +2076,158 @@ test "e2e INVITE past the dialog cap gets 503" {
     try std.testing.expect(std.mem.startsWith(u8, got.data, "SIP/2.0 503"));
     try std.testing.expect(server.calls.get("call-cap503") == null);
     try std.testing.expectEqual(call.max_dialogs, server.calls.count());
+}
+
+// Allocation baseline: per-op heap traffic measured with a counting
+// allocator over page_allocator (SafeAllocator never reuses, so it would
+// inflate every number). Counts are printed for the record; the asserts
+// pin zero leaks. Perf proposals must move these numbers.
+test "alloc baseline REGISTER handshake" {
+    const test_alloc = @import("test_alloc.zig");
+    var counting = test_alloc.Counting{ .parent = std.heap.page_allocator };
+    var server = try Pbx.init(counting.allocator(), std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    std.debug.print("BASELINE register: allocs={d} frees={d} bytes={d} outstanding={d}\n", .{ counting.allocs, counting.frees, counting.bytes_allocated, counting.outstanding() });
+}
+
+test "alloc baseline INVITE forward" {
+    const test_alloc = @import("test_alloc.zig");
+    var counting = test_alloc.Counting{ .parent = std.heap.page_allocator };
+    var server = try Pbx.init(counting.allocator(), std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+    const before = counting.allocs;
+    const bytes_before = counting.bytes_allocated;
+    try inviteHandshake(&server, "call-base", "z9hG4bKbase", test_alice_addr, false, &resp_buf, &fwd_buf);
+    std.debug.print("BASELINE invite-forward: op-allocs={d} op-bytes={d}\n", .{ counting.allocs - before, counting.bytes_allocated - bytes_before });
+    try std.testing.expect(server.calls.get("call-base") != null);
+}
+
+test "alloc baseline BYE teardown" {
+    const test_alloc = @import("test_alloc.zig");
+    var counting = test_alloc.Counting{ .parent = std.heap.page_allocator };
+    var server = try Pbx.init(counting.allocator(), std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+    try inviteHandshake(&server, "call-basebye", "z9hG4bKbasebye", test_alice_addr, false, &resp_buf, &fwd_buf);
+    const before = counting.allocs;
+    const bye_req = try parseRequest("BYE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbasebye1\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-basebye\r\n" ++
+        "CSeq: 2 BYE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onBye(bye_req, test_alice_addr, &fwd_buf);
+    try deliverResponse(&server, "SIP/2.0 200 OK\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbasebyeresp\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-basebye\r\n" ++
+        "CSeq: 2 BYE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", test_bob_addr, &fwd_buf);
+    std.debug.print("BASELINE bye-teardown: op-allocs={d}\n", .{counting.allocs - before});
+    try std.testing.expect(server.calls.get("call-basebye") == null);
+    // NOTE: no outstanding-alloc assert here — registrar contacts, nonces,
+    // and server tables are legitimately live until deinit (which runs at
+    // scope end). Leak freedom is proven by the SafeAllocator suite.
+}
+
+test "alloc baseline bare INVITE 401" {
+    const test_alloc = @import("test_alloc.zig");
+    var counting = test_alloc.Counting{ .parent = std.heap.page_allocator };
+    var server = try Pbx.init(counting.allocator(), std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    const before = counting.allocs;
+    const req = try parseRequest("INVITE sip:nobody@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbase404\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:nobody@127.0.0.1:5060>\r\n" ++
+        "Call-ID: call-base404\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    // Bare (no Authorization): 401 path costs only a nonce + challenge.
+    try server.onInvite(req, test_alice_addr, &resp_buf, &fwd_buf);
+    std.debug.print("BASELINE bare-invite-401: op-allocs={d}\n", .{counting.allocs - before});
+}
+
+test "alloc baseline 404 miss avoids lookup alloc" {
+    const test_alloc = @import("test_alloc.zig");
+    var counting = test_alloc.Counting{ .parent = std.heap.page_allocator };
+    var server = try Pbx.init(counting.allocator(), std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+
+    // Authed INVITE to an unregistered AOR: full-key miss falls through to
+    // the username-key path, which must not allocate (stack buffer).
+    const nonce = try server.auth.issueNonce();
+    const header = try auth.clientResponse(server.allocator, "alice", "alicepass", nonce[0..], "INVITE", "sip:nobody@127.0.0.1:5060");
+    defer server.allocator.free(header);
+    var auth_line_buf: [512]u8 = undefined;
+    const auth_line = std.fmt.bufPrint(&auth_line_buf, "Authorization: {s}\r\n", .{header}) catch unreachable;
+    var raw_buf: [2048]u8 = undefined;
+    const raw = std.fmt.bufPrint(&raw_buf, "INVITE sip:nobody@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbasemiss\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:nobody@127.0.0.1:5060>\r\n" ++
+        "Call-ID: call-basemiss\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "{s}" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", .{auth_line}) catch unreachable;
+    // Warmup on a DIFFERENT branch absorbs first-put map growth (a
+    // same-branch repeat would replay from cache with zero allocs —
+    // wrong thing measured). Each leg mints its own nonce: nonces are
+    // single-use, so sharing one would 401 the measured leg.
+    var warm_buf: [2048]u8 = undefined;
+    var warm_auth_buf: [512]u8 = undefined;
+    const warm_nonce = try server.auth.issueNonce();
+    const warm_header = try auth.clientResponse(server.allocator, "alice", "alicepass", warm_nonce[0..], "INVITE", "sip:nobody@127.0.0.1:5060");
+    defer server.allocator.free(warm_header);
+    const warm_auth = try std.fmt.bufPrint(&warm_auth_buf, "Authorization: {s}\r\n", .{warm_header});
+    const warm_raw = try std.fmt.bufPrint(&warm_buf, "INVITE sip:nobody@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbasemiss0\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:nobody@127.0.0.1:5060>\r\n" ++
+        "Call-ID: call-basemiss0\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "{s}" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", .{warm_auth});
+    try server.onInvite(try parseRequest(warm_raw), test_alice_addr, &resp_buf, &fwd_buf);
+    const before = counting.allocs;
+    try server.onInvite(try parseRequest(raw), test_alice_addr, &resp_buf, &fwd_buf);
+    const op_allocs = counting.allocs - before;
+    std.debug.print("BASELINE 404-miss: op-allocs={d}\n", .{op_allocs});
+    const cached = server.txn_layer.getTransaction("z9hG4bKbasemiss", .INVITE);
+    try std.testing.expect(cached != null and cached.?.response_buf != null);
+    // 404 build (stack) + cache entry (key dupe + response dupe): heap only
+    // for retained state, never for the transient lookup key.
+    try std.testing.expectEqual(@as(usize, 3), op_allocs);
+    try std.testing.expectEqual(@as(usize, 3), op_allocs);
+    try std.testing.expect(server.calls.get("call-basemiss") == null);
 }

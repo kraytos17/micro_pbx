@@ -30,6 +30,13 @@ pub const Call = struct {
     caller_from: ?[]u8 = null,
     caller_to: ?[]u8 = null,
     invite_cseq: u32 = 0,
+    /// Re-INVITE leg headers, for rendering a 408 if the re-leg times out.
+    /// invite_branch stays the ORIGINAL leg (Timer-B identity); these track
+    /// the latest renegotiation attempt. Arena-owned, orphaned on supersede
+    /// (reclaimed at teardown — bounded, documented).
+    reinvite_via: ?[]u8 = null,
+    reinvite_from: ?[]u8 = null,
+    reinvite_to: ?[]u8 = null,
 };
 
 /// One dialog: call state plus its client transaction, sharing one arena

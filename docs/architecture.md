@@ -38,6 +38,20 @@ reaped. Registrar sweep runs at most every 60s (`:98`,
    no re-forward, no new state, no re-challenge (consumed nonces stay
    consumed).
 
+## Re-INVITE (`forwardReinvite`, established + higher CSeq only)
+Pre-answer retries, same-branch dupes, and stale CSeq all absorb exactly
+as before — only `established` + `cseq > invite_cseq` renegotiates, and
+it skips authentication (rides the dialog, like BYE). The forward reuses
+the session (caller leg updated in place via `setCaller`; ports/sockets
+stay), mints a fresh PBX branch without a 100, and tracks the re-leg in
+the free `invite_txn` slot. `invite_branch` keeps the ORIGINAL leg (Timer-B
+identity); `invite_cseq` advances; `reinvite_via/from/to` feed re-leg 408
+rendering. Answers land in the established-state 2xx arm (forward +
+`setCallee`, no state flip, transaction completed so no phantom 408);
+an unanswered re-leg 408s without teardown (branch compared, dialog kept).
+Re-ACKs only forward — relay sockets open once (`== null` guard), or every
+re-ACK would rebind held ports into the error log.
+
 ## Responses (`handleResponse`, `src/pbx.zig:522`)
 1. CANCEL responses terminate here (caller was already answered, `:532`).
 2. `dest_addr` defaults to the caller (`:537`): correct for every

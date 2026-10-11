@@ -149,18 +149,22 @@ pub fn clientResponseQop(
     );
 }
 
-/// Renders a WWW-Authenticate challenge header value.
-pub fn challenge(allocator: std.mem.Allocator, nonce: []const u8, stale: bool) ![]u8 {
+/// Renders a WWW-Authenticate challenge header value into the caller's
+/// buffer (bounded: realm is const, nonce 32 hex; 192 bytes always fits).
+pub fn challenge(buf: []u8, nonce: []const u8, stale: bool) ![]u8 {
+    var w = std.Io.Writer.fixed(buf);
     if (stale) {
-        return allocator.print(
+        try w.print(
             "Digest realm=\"{s}\", nonce=\"{s}\", algorithm=MD5, qop=\"auth\", stale=true",
             .{ realm, nonce },
         );
+    } else {
+        try w.print(
+            "Digest realm=\"{s}\", nonce=\"{s}\", algorithm=MD5, qop=\"auth\"",
+            .{ realm, nonce },
+        );
     }
-    return allocator.print(
-        "Digest realm=\"{s}\", nonce=\"{s}\", algorithm=MD5, qop=\"auth\"",
-        .{ realm, nonce },
-    );
+    return w.buffered();
 }
 
 pub const Auth = struct {

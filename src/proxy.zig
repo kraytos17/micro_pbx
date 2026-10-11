@@ -189,11 +189,13 @@ pub fn handleInvite(
     pbx_addr: std.Io.net.IpAddress,
     resp_buf: []u8,
     fwd_buf: []u8,
-    allocator: std.mem.Allocator,
+    branch_buf: *[32]u8,
     io: std.Io,
 ) !struct { branch: []u8, forwarded: []u8 } {
     try sendResponse(socket, from_addr, resp_buf, 100, "Trying", req);
-    const branch = try generateBranch(allocator, io);
+    // Caller-owned buffer: the returned branch borrows it, so all uses
+    // (arena dupes below) must complete before the caller returns.
+    const branch = generateBranch(branch_buf, io);
     const forwarded = try buildForwardedRequest(req, pbx_addr, branch, fwd_buf);
     try socket.sendTo(forwarded, contact.address);
     return .{ .branch = branch, .forwarded = forwarded };
@@ -207,14 +209,13 @@ pub fn handleRegister(
     authenticator: *auth.Auth,
     socket: *transport.UdpSocket,
     resp_buf: []u8,
-    allocator: std.mem.Allocator,
 ) !void {
     const username = authenticator.verifyRequest(req) catch |err| {
         // Authentication failures are answers, not errors: challenge the
         // client (stale nonces say so explicitly per RFC 3261).
         const stale = err == error.StaleNonce;
         if (stale) log.info("stale nonce for {s}, re-challenging", .{req.request_uri});
-        return try sendUnauthorized(socket, from_addr, authenticator, resp_buf, req, allocator, stale);
+        return try sendUnauthorized(socket, from_addr, authenticator, resp_buf, req, stale);
     };
 
     log.debug("REGISTER {s} authenticated as {s}", .{ req.request_uri, username });
@@ -337,25 +338,30 @@ pub fn sendUnauthorized(
     authenticator: *auth.Auth,
     buf: []u8,
     req: msg.Request,
-    allocator: std.mem.Allocator,
     stale: bool,
 ) !void {
     const nonce = try authenticator.issueNonce();
-    const www_auth = try auth.challenge(allocator, nonce[0..], stale);
-    defer allocator.free(www_auth);
+    var challenge_buf: [192]u8 = undefined;
+    const www_auth = try auth.challenge(&challenge_buf, nonce[0..], stale);
     const response = try buildResponse(buf, 401, "Unauthorized", req, www_auth);
     try socket.sendTo(response, to);
 }
 
 /// Generates a random RFC 3261-style branch identifier.
-pub fn generateBranch(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
-    var buf: [8]u8 = undefined;
-    std.Io.random(io, &buf);
-    const suffix = std.mem.readInt(u64, &buf, .little);
-    return allocator.print("z9hG4bK{x}", .{suffix});
+/// Mints a Via branch into the caller's 32-byte buffer (no allocation:
+/// "z9hG4bK" + 16 hex = 24 bytes, always fits). All call sites hold the
+/// branch for the call duration only.
+pub fn generateBranch(buf: *[32]u8, io: std.Io) []u8 {
+    var rand: [8]u8 = undefined;
+    std.Io.random(io, &rand);
+    const suffix = std.mem.readInt(u64, &rand, .little);
+    return std.fmt.bufPrint(buf, "z9hG4bK{x}", .{suffix}) catch unreachable;
 }
 
-fn buildForwardedRequest(
+/// Builds the forwarded request (Via prepended, Max-Forwards decremented).
+/// Public for the re-INVITE path, which forwards without the 100 that
+/// handleInvite sends.
+pub fn buildForwardedRequest(
     req: msg.Request,
     pbx_addr: std.Io.net.IpAddress,
     branch: []const u8,

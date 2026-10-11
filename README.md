@@ -84,20 +84,20 @@ registration, call setup/teardown, instant messaging, and media relay
 ```sh
 zig build            # builds ./zig-out/bin/micro_pbx
 zig build run        # build and run the PBX
-zig build test       # run all 125 unit tests
+zig build test       # run all 131 unit tests
 ```
 
 The PBX listens on UDP `0.0.0.0:5060` by default
 (`Pbx.init(allocator, io, 5060)` in `src/main.zig`).
 
-### Unit tests (125)
+### Unit tests (131)
 
-`zig test src/main.zig`: 123 named tests plus 2 `refAllDecls` blocks:
+`zig test src/main.zig`: 129 named tests plus 2 `refAllDecls` blocks:
 
 | Module | Tests | Covers |
 |---|---|---|
 | `sip/parser.zig` | 20 | zero-copy parse, folded Via, 404 responses, SDP bodies |
-| `pbx.zig` | 25 (all e2e) | full dispatch lifecycle incl. INVITE auth (bare/wrong/unknown/duplicate), CANCEL races, 404 cache, Timer B 408, Timer D sweep, overload 503, wrong-password stores nothing |
+| `pbx.zig` | 31 (all e2e) | full dispatch lifecycle incl. INVITE auth (bare/wrong/unknown/duplicate), re-INVITE (forward/absorb/answer/timeout), CANCEL races, 404 cache, Timer B 408, Timer D sweep, overload 503, wrong-password stores nothing |
 | `sip/transaction.zig` | 14 | tick/retransmit/backoff cap, elapsed Timer B/F, `nextTimeout` lapse term, table-full |
 | `proxy.zig` | 13 | builders (byte-exact incl. 408/401/404), Via strip/fold, REGISTER/unregister, OPTIONS 200/404 |
 | `call.zig` | 12 | dialog table, arenas, timer helpers, dialog-cap |
@@ -114,7 +114,7 @@ so they own loopback ports 5090/5092 — never run `zig test` concurrently
 with the interop suite, and never move test addresses into the interop
 port map (both sides document the reservation).
 
-### Live interop (SIPp + pytest + Python callers, 16 scenarios)
+### Live interop (SIPp + pytest + Python callers, 17 scenarios)
 
 `./interop.sh` (root wrapper: checks for `uv`/`sipp`/`zig`, translates
 `--slow`, passes everything else to pytest):
@@ -147,6 +147,7 @@ format if a tool ever demands it).
 | `callee_bye` | Python caller answers callee BYE with 200 |
 | `callee_bye_rejected` | caller rejects callee BYE with 403 → routed to callee, dialog removed (probe BYE gets 481), nothing cached |
 | `s9_rtp_relay` | live media loop: RTP to relay port from SDP port → echo UAS → byte-identical ordered echoes, both directions logged |
+| `s10_reinvite` | caller re-INVITE mid-dialog (new SDP port 20002): forwarded rewritten, answered in established state, echo loop follows, teardown |
 | `s8_timer_b` (slow) | Python caller handshakes with silent contact then lingers: 408 at 32.000s after the forwarded leg (Timer B), teardown |
 | `no_errors` (always last) | zero `] error(` lines in the whole run's PBX log |
 
@@ -300,7 +301,7 @@ Two baresip instances (Alice, Bob) registering to the PBX, then a call.
   state (`transport.UdpSocket`, `Auth`, `Registrar`, `TransactionLayer`, call
   table, RTP sessions) and dispatches through `handleResponse` /
   `handleTimeout` / `on*` methods. `main.zig` is a 73-line bootstrap.
-- **E2E harness** in `pbx.zig` (25 tests) exercises the actual dispatch methods
+- **E2E harness** in `pbx.zig` (31 tests) exercises the actual dispatch methods
   with parsed SIP messages. Full coverage of the call lifecycle, CANCEL
   races, 404 caching, 408/Timer D expiry, overload 503, RTP session creation,
   and registration expiry. These tests emit real loopback UDP (hence the

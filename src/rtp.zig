@@ -137,6 +137,22 @@ pub const Sessions = struct {
         return self.sessions.getPtr(call_id);
     }
 
+    /// Records the caller's renegotiated media endpoint (from a re-INVITE
+    /// SDP). Mirror of setCallee; relay ports and sockets are untouched.
+    /// Unknown calls are ignored.
+    pub fn setCaller(
+        self: *Sessions,
+        call_id: []const u8,
+        caller_ip: net.IpAddress,
+        caller_port: u16,
+        caller_pt: u7,
+    ) void {
+        const session = self.sessions.getPtr(call_id) orelse return;
+        session.caller_ip = caller_ip;
+        session.caller_rtp_port = caller_port;
+        session.caller_payload_type = caller_pt;
+    }
+
     /// Records the callee's answered media endpoint (from its 200 OK SDP).
     /// Unknown calls are ignored.
     pub fn setCallee(

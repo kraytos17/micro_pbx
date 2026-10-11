@@ -27,8 +27,15 @@ from conftest import (
     run_sipp_uac,
     sipp_uas,
 )
-from invite import (Dialog, InviteError, MediaSocket, bare_invite_status,
-                   parse_to_tag, rtp_packet, sdp_media_port)
+from invite import (
+    Dialog,
+    InviteError,
+    MediaSocket,
+    bare_invite_status,
+    parse_to_tag,
+    rtp_packet,
+    sdp_media_port,
+)
 from register import (
     RegisterError,
     bare_register_status,
@@ -279,6 +286,61 @@ def test_s9_rtp_relay(pbx, logs_dir):
                 media.close()
         assert uas.returncode == 0, "s9 UAS exited non-zero"
         assert_sipp_ok(logs_dir / "s9-rtp-uas-out.txt")
+
+
+def test_s10_reinvite(pbx, logs_dir):
+    """Caller-initiated re-INVITE mid-dialog: new SDP offer (caller media
+    moves 20000→20002) forwards with rewritten SDP, callee answers, media
+    loop follows the new port, teardown clean. Bare (established legs ride
+    the authenticated dialog)."""
+    with expect_log_growth(logs_dir, "terminated (BYE)"):
+        register("bob", "bobpass", UAS_PORT)
+        echo_flags = ("-rtp_echo", "-mi", "127.0.0.1",
+                      "-min_rtp_port", "4000", "-max_rtp_port", "4000")
+        with sipp_uas(logs_dir, "s10-reinvite", "uas-reinvite.xml",
+                       UAS_PORT, extra=echo_flags) as uas:
+            time.sleep(1)
+            dlg = Dialog("alice", "alicepass", UAC_PORT)
+            media = MediaSocket(20000)
+            try:
+                call_id = f"pyri-{os.urandom(4).hex()}"
+                to_tag, ok = dlg.invite("bob", call_id, "pyalice1")
+                relay_caller = sdp_media_port(ok)
+                assert relay_caller and relay_caller != 20000
+                dlg.ack("bob", call_id, "pyalice1", to_tag, 2)
+                time.sleep(0.5)
+                # Baseline loop on the original ports.
+                p0 = rtp_packet(1, 160, 0xAA, bytes([1]) * 160)
+                media.send(p0, ("127.0.0.1", relay_caller))
+                assert media.recv() == p0, "baseline media loop broken"
+                media.close()
+                # Renegotiate: caller media moves to 20002.
+                media2 = MediaSocket(20002)
+                try:
+                    ok2 = dlg.reinvite("bob", call_id, "pyalice1", to_tag,
+                                       20002)
+                    assert sdp_media_port(ok2) == relay_caller, (
+                        "re-INVITE must reuse the session relay ports")
+                    dlg.ack("bob", call_id, "pyalice1", to_tag, 3)
+                    time.sleep(0.5)
+                    p1 = rtp_packet(2, 320, 0xAA, bytes([2]) * 160)
+                    media2.send(p1, ("127.0.0.1", relay_caller))
+                    got = media2.recv()
+                    assert got == p1, "media did not follow the new port"
+                finally:
+                    media2.close()
+                dlg.bye("bob", call_id, 4, "pyalice1", to_tag)
+            finally:
+                dlg.close()
+        assert uas.returncode == 0, "s10 UAS exited non-zero"
+        assert_sipp_ok(logs_dir / "s10-reinvite-uas-out.txt")
+
+        # UAS saw exactly 2 INVITEs (initial + re-INVITE, CSeq 1/2 then 3).
+        msgs = parse_sipp_msg_log(logs_dir / "s10-reinvite-uas-msg.log")
+        invites = [m for m in msgs
+                   if m.direction == "received" and m.is_request("INVITE")]
+        assert len(invites) == 2, (
+            f"s10: want 2 INVITEs at UAS, got {len(invites)}")
 
 
 @pytest.mark.slow

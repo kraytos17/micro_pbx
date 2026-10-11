@@ -25,6 +25,7 @@ Fixed: the PBX routes by source address, so these are load-bearing:
 | 5070 | sipp callee (UAS) / registered-contact port | `UAS_PORT` |
 | 5090 / 5092 | unit-test peers | `test_alice_addr` / `test_bob_addr`, `src/pbx.zig:664-666` |
 | 20000 | Python caller RTP (bound by `MediaSocket`, matches offered SDP) | media must originate here (exact-endpoint match) |
+| 20002 | re-INVITE caller RTP (rebound `MediaSocket`, S10 port move) | same rule after renegotiation |
 | 4000–4001 | sipp UAS media+RTCP (pinned via `-min/-max_rtp_port`) | must equal the hardcoded `m=audio 4000` (PBX matches declared ports) |
 | 10000+ | PBX relay ports (step 4, wrap 60000) | advertised in rewritten SDP, learned from 200's `m=` |
 
