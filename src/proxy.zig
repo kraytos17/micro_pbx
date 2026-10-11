@@ -106,11 +106,24 @@ fn stripTopVia(raw: []const u8, out: []u8) []u8 {
         return out[0..raw.len];
     };
 
-    const via_line_end = line_end + 2; // include \r\n
-    const after_via = raw[via_line_end..];
-    @memcpy(out[0..via_start], raw[0..via_start]);
-    @memcpy(out[via_start..][0..after_via.len], after_via);
-    return out[0 .. raw.len - (via_line_end - via_start)];
+    // A Via line may fold several values ("Via: A, B", RFC 3261).
+    // Folded: drop only the first value, keeping the "Via: " prefix.
+    // Single: drop the whole line (original behavior).
+    const prefix_end = via_start + "Via: ".len;
+    var keep_end = via_start;
+    var drop_end = line_end + 2;
+    if (std.mem.findPos(u8, raw, prefix_end, ",")) |comma| {
+        if (comma < line_end) {
+            keep_end = prefix_end;
+            drop_end = comma + 1;
+            if (drop_end < raw.len and raw[drop_end] == ' ') drop_end += 1;
+        }
+    }
+
+    const tail = raw[drop_end..];
+    @memcpy(out[0..keep_end], raw[0..keep_end]);
+    @memcpy(out[keep_end..][0..tail.len], tail);
+    return out[0 .. raw.len - (drop_end - keep_end)];
 }
 
 /// Print into a fixed-buffer writer, mapping overflow to BufferTooSmall.
@@ -226,17 +239,12 @@ pub fn buildResponse(
     status: u16,
     reason: []const u8,
     req: msg.Request,
-    branch: ?[]const u8,
 ) ![]u8 {
     var w = std.Io.Writer.fixed(buf);
     try emit(&w, "SIP/2.0 {d} {s}\r\n", .{ status, reason });
-    // Build Via header with branch
-    if (branch) |b| {
-        try emit(&w, "Via: {s};branch={s}\r\n", .{ req.via, b });
-    } else {
-        try emit(&w, "Via: {s}\r\n", .{req.via});
-    }
-
+    // A generated response echoes the top Via unchanged (RFC 3261);
+    // appending a branch would corrupt transaction matching downstream.
+    try emit(&w, "Via: {s}\r\n", .{req.via});
     try emit(&w, "From: {s}\r\n", .{req.from});
     try emit(&w, "To: {s}\r\n", .{req.to});
     try emit(&w, "Call-ID: {s}\r\n", .{req.call_id});
@@ -278,7 +286,7 @@ pub fn sendResponse(
     reason: []const u8,
     req: msg.Request,
 ) !void {
-    sendResponseWithBranch(socket, to, buf, status, reason, req, null) catch |err| return err;
+    sendResponseWithBranch(socket, to, buf, status, reason, req) catch |err| return err;
 }
 
 pub fn sendResponseWithBranch(
@@ -288,16 +296,11 @@ pub fn sendResponseWithBranch(
     status: u16,
     reason: []const u8,
     req: msg.Request,
-    branch: ?[]const u8,
 ) !void {
     var w = std.Io.Writer.fixed(buf);
     try emit(&w, "SIP/2.0 {d} {s}\r\n", .{ status, reason });
-    // If we have a branch, add it to the Via header (RFC 3261 compliance)
-    if (branch) |b| {
-        try emit(&w, "Via: {s};branch={s}\r\n", .{ req.via, b });
-    } else {
-        try emit(&w, "Via: {s}\r\n", .{req.via});
-    }
+    // Echo the top Via unchanged; see buildResponse.
+    try emit(&w, "Via: {s}\r\n", .{req.via});
 
     try emit(&w, "From: {s}\r\n", .{req.from});
     try emit(&w, "To: {s}\r\n", .{req.to});
@@ -332,7 +335,10 @@ fn buildForwardedRequest(
     try emit(&w, "Via: {s} {d}.{d}.{d}.{d}:{d};branch={s}\r\n", .{ via_proto, pbx_addr.ip4.bytes[0], pbx_addr.ip4.bytes[1], pbx_addr.ip4.bytes[2], pbx_addr.ip4.bytes[3], pbx_addr.ip4.port, branch });
 
     try emit(&w, "Via: {s}\r\n", .{req.via});
-    try emit(&w, "Max-Forwards: 70\r\n", .{});
+    const max_forwards = req.max_forwards orelse 70;
+    if (max_forwards == 0) return error.MaxForwardsExceeded;
+
+    try emit(&w, "Max-Forwards: {d}\r\n", .{max_forwards - 1});
     try emit(&w, "From: {s}\r\n", .{req.from});
     try emit(&w, "To: {s}\r\n", .{req.to});
     try emit(&w, "Call-ID: {s}\r\n", .{req.call_id});
@@ -448,5 +454,80 @@ test "buildTimeoutResponse renders 408" {
             "Content-Length: 0\r\n" ++
             "\r\n",
         out,
+    );
+}
+
+fn mfTestRequest(max_forwards: ?u32) msg.Request {
+    return .{
+        .method = .INVITE,
+        .request_uri = "sip:bob@127.0.0.1:5060",
+        .via = "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKorig",
+        .via_branch = "z9hG4bKorig",
+        .via_branch2 = "",
+        .from = "<sip:alice@127.0.0.1:5060>;tag=aliceTag",
+        .from_tag = "aliceTag",
+        .to = "<sip:bob@127.0.0.1:5060>",
+        .to_tag = null,
+        .call_id = "mf-test@127.0.0.1",
+        .cseq_num = 1,
+        .cseq_method = .INVITE,
+        .contact = null,
+        .expires = null,
+        .content_type = null,
+        .max_forwards = max_forwards,
+        .body = "",
+    };
+}
+
+const mfTestPbxAddr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 127, 0, 0, 1 }, .port = 5060 } };
+
+test "buildForwardedRequest decrements Max-Forwards" {
+    var buf: [2048]u8 = undefined;
+    const out = try buildForwardedRequest(mfTestRequest(5), mfTestPbxAddr, "z9hG4bKfwd", &buf);
+    try std.testing.expect(std.mem.find(u8, out, "Max-Forwards: 4\r\n") != null);
+}
+
+test "buildForwardedRequest defaults absent Max-Forwards to 69" {
+    var buf: [2048]u8 = undefined;
+    const out = try buildForwardedRequest(mfTestRequest(null), mfTestPbxAddr, "z9hG4bKfwd", &buf);
+    try std.testing.expect(std.mem.find(u8, out, "Max-Forwards: 69\r\n") != null);
+}
+
+test "buildForwardedRequest rejects exhausted Max-Forwards" {
+    var buf: [2048]u8 = undefined;
+    const out = buildForwardedRequest(mfTestRequest(0), mfTestPbxAddr, "z9hG4bKfwd", &buf);
+    try std.testing.expectError(error.MaxForwardsExceeded, out);
+}
+
+test "stripTopVia removes only the first value of a folded Via" {
+    var out: [512]u8 = undefined;
+    const raw =
+        "SIP/2.0 180 Ringing\r\n" ++
+        "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKtop, SIP/2.0/UDP 192.168.1.5:5060;branch=z9hG4bKnext\r\n" ++
+        "From: a\r\n" ++
+        "\r\n";
+    const stripped = stripTopVia(raw, &out);
+    try std.testing.expectEqualStrings(
+        "SIP/2.0 180 Ringing\r\n" ++
+            "Via: SIP/2.0/UDP 192.168.1.5:5060;branch=z9hG4bKnext\r\n" ++
+            "From: a\r\n" ++
+            "\r\n",
+        stripped,
+    );
+}
+
+test "stripTopVia removes a lone Via line whole" {
+    var out: [512]u8 = undefined;
+    const raw =
+        "SIP/2.0 200 OK\r\n" ++
+        "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKonly\r\n" ++
+        "From: a\r\n" ++
+        "\r\n";
+    const stripped = stripTopVia(raw, &out);
+    try std.testing.expectEqualStrings(
+        "SIP/2.0 200 OK\r\n" ++
+            "From: a\r\n" ++
+            "\r\n",
+        stripped,
     );
 }

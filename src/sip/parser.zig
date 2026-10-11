@@ -40,6 +40,7 @@ fn parseRequest(
         .request_uri = uri,
         .via = "",
         .via_branch = "",
+        .via_branch2 = "",
         .from = "",
         .from_tag = "",
         .to = "",
@@ -79,6 +80,7 @@ fn parseResponse(
         .reason_phrase = reason,
         .via = "",
         .via_branch = "",
+        .via_branch2 = "",
         .from = "",
         .from_tag = "",
         .to = "",
@@ -107,7 +109,10 @@ fn parseRequestHeaders(out: *msg.Request, lines: *std.mem.SplitIterator(u8, .seq
         if (std.mem.eql(u8, key_lower, "via") or std.mem.eql(u8, key_lower, "v")) {
             if (out.via.len == 0) {
                 out.via = value;
-                out.via_branch = extractParam(value, "branch") orelse "";
+                out.via_branch = firstBranch(value);
+                out.via_branch2 = secondBranch(value);
+            } else if (out.via_branch2.len == 0) {
+                out.via_branch2 = firstBranch(value);
             }
         } else if (std.mem.eql(u8, key_lower, "from") or std.mem.eql(u8, key_lower, "f")) {
             out.from = value;
@@ -144,7 +149,10 @@ fn parseResponseHeaders(out: *msg.Response, lines: *std.mem.SplitIterator(u8, .s
         if (std.mem.eql(u8, key_lower, "via") or std.mem.eql(u8, key_lower, "v")) {
             if (out.via.len == 0) {
                 out.via = value;
-                out.via_branch = extractParam(value, "branch") orelse "";
+                out.via_branch = firstBranch(value);
+                out.via_branch2 = secondBranch(value);
+            } else if (out.via_branch2.len == 0) {
+                out.via_branch2 = firstBranch(value);
             }
         } else if (std.mem.eql(u8, key_lower, "from") or std.mem.eql(u8, key_lower, "f")) {
             out.from = value;
@@ -172,6 +180,25 @@ fn extractParam(value: []const u8, name: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Branch of the first Via value in a (possibly folded) Via line.
+/// A folded line ("Via: A, B") carries one branch per value; the first
+/// belongs to this (top) Via. Via params never contain commas, so splitting
+/// on the first comma is safe.
+fn firstBranch(value: []const u8) []const u8 {
+    var vals = std.mem.splitScalar(u8, value, ',');
+    const first = std.mem.trim(u8, vals.next() orelse return "", " ");
+    return extractParam(first, "branch") orelse "";
+}
+
+/// Branch of the second Via value in a folded Via line, or "".
+fn secondBranch(value: []const u8) []const u8 {
+    var vals = std.mem.splitScalar(u8, value, ',');
+    _ = vals.next();
+
+    const second = std.mem.trim(u8, vals.next() orelse return "", " ");
+    return extractParam(second, "branch") orelse "";
 }
 
 fn parseCSeq(out: anytype, value: []const u8) !void {
@@ -447,4 +474,78 @@ test "extractParam does not prefix-match" {
 test "extractParam no-match and no-equals returns null" {
     try std.testing.expect(extractParam("tag=abc", "branch") == null);
     try std.testing.expect(extractParam("tagonly", "tag") == null);
+}
+
+test "parse request captures second Via branch" {
+    const raw =
+        "INVITE sip:bob@pbx.local SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKfirst\r\n" ++
+        "Via: SIP/2.0/UDP 192.168.1.5:5060;branch=z9hG4bKsecond\r\n" ++
+        "From: Alice <sip:alice@pbx.local>;tag=aaa\r\n" ++
+        "To: Bob <sip:bob@pbx.local>\r\n" ++
+        "Call-ID: via2@192.168.1.5\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n";
+
+    const result = try parse(raw);
+    const req = result.request;
+
+    try std.testing.expectEqualStrings("z9hG4bKfirst", req.via_branch);
+    try std.testing.expectEqualStrings("z9hG4bKsecond", req.via_branch2);
+}
+
+test "parse response captures second Via branch" {
+    const raw =
+        "SIP/2.0 486 Busy Here\r\n" ++
+        "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKpbx\r\n" ++
+        "Via: SIP/2.0/UDP 192.168.1.5:5060;branch=z9hG4bKcaller\r\n" ++
+        "From: Alice <sip:alice@pbx.local>;tag=aaa\r\n" ++
+        "To: Bob <sip:bob@pbx.local>;tag=bbb\r\n" ++
+        "Call-ID: via2resp@192.168.1.5\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n";
+
+    const result = try parse(raw);
+    const resp = result.response;
+
+    try std.testing.expectEqualStrings("z9hG4bKpbx", resp.via_branch);
+    try std.testing.expectEqualStrings("z9hG4bKcaller", resp.via_branch2);
+}
+
+test "parse single Via leaves second branch empty" {
+    const raw =
+        "SIP/2.0 200 OK\r\n" ++
+        "Via: SIP/2.0/UDP 192.168.1.5:5060;branch=z9hG4bKonly\r\n" ++
+        "From: Alice <sip:alice@pbx.local>;tag=aaa\r\n" ++
+        "To: Bob <sip:bob@pbx.local>;tag=bbb\r\n" ++
+        "Call-ID: singlevia@192.168.1.5\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n";
+
+    const result = try parse(raw);
+    const resp = result.response;
+
+    try std.testing.expectEqualStrings("z9hG4bKonly", resp.via_branch);
+    try std.testing.expectEqualStrings("", resp.via_branch2);
+}
+
+test "parse folded Via line takes first branch, second value" {
+    const raw =
+        "SIP/2.0 180 Ringing\r\n" ++
+        "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKfold1, SIP/2.0/UDP 192.168.1.5:5060;branch=z9hG4bKfold2\r\n" ++
+        "From: Alice <sip:alice@pbx.local>;tag=aaa\r\n" ++
+        "To: Bob <sip:bob@pbx.local>\r\n" ++
+        "Call-ID: folded@192.168.1.5\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n";
+
+    const result = try parse(raw);
+    const resp = result.response;
+
+    try std.testing.expectEqualStrings("z9hG4bKfold1", resp.via_branch);
+    try std.testing.expectEqualStrings("z9hG4bKfold2", resp.via_branch2);
 }

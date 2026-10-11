@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- Callee side for S4/S5: handles ONE dialog starting at the INVITE.
+     Bob must already be registered from this port (see uas-reg.xml, run
+     before this process starts): the REGISTER exchange needs this socket's
+     own Call-ID, while the dialog arrives under the caller's foreign one,
+     so the two cannot share a scenario run. -->
+<scenario name="pbx-callee-answer">
+  <recv request="INVITE" timeout="15000">
+  </recv>
+
+  <!-- Brief processing delay (well under Timer A): with the UAS answering
+       fast, any duplicate INVITE at the UAS would prove a PBX re-forward.
+       Caller-side duplicates are driven explicitly by the caller scenario. -->
+  <pause milliseconds="100"/>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 180 Ringing
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=sippbob1
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:bob@[local_ip]:[local_port]>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=sippbob1
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:bob@[local_ip]:[local_port]>
+      Content-Type: application/sdp
+      Content-Length: 88
+
+      v=0
+      o=bob 999 111 IN IP4 127.0.0.1
+      s=sipp
+      c=IN IP4 127.0.0.1
+      m=audio 4000 RTP/AVP 0
+
+    ]]>
+  </send>
+
+  <recv request="ACK" timeout="8000">
+  </recv>
+
+  <recv request="BYE" timeout="15000">
+  </recv>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <pause milliseconds="500"/>
+
+  <!-- End of call. -->
+</scenario>

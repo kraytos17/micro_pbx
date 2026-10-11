@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- S1: baseline REGISTER. Expects 200 OK. Exercises the registrar over UDP. -->
+<scenario name="pbx-register-alice">
+  <send retrans="500">
+    <![CDATA[
+      REGISTER sip:alice@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/UDP [local_ip]:[local_port];branch=z9hG4bKsipp-reg-alice
+      Max-Forwards: 70
+      From: <sip:alice@[remote_ip]:[remote_port]>;tag=sippalice-reg
+      To: <sip:alice@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:alice@[local_ip]:[local_port]>
+      Expires: 3600
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" timeout="8000">
+  </recv>
+
+  <!-- End of call. -->
+</scenario>

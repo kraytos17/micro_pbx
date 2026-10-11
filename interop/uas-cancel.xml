@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- Callee side for S6: handles one dialog (see uas-reg.xml note on why
+     REGISTER lives in a separate run). On INVITE waits for the CANCEL,
+     answers 200 to the CANCEL plus 487 to the INVITE. The INVITE CSeq
+     number is saved because [last_CSeq:] is overwritten by the CANCEL. -->
+<scenario name="pbx-callee-cancel">
+  <recv request="INVITE" timeout="15000">
+  </recv>
+
+  <recv request="CANCEL" timeout="15000">
+  </recv>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=sippbob1
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 487 Request Terminated
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=sippbob1
+      [last_Call-ID:]
+      CSeq: 1 INVITE
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <pause milliseconds="500"/>
+
+  <!-- End of call. -->
+</scenario>

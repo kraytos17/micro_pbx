@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- S7: INVITE with an exhausted Max-Forwards. Expects 483 Too Many Hops
+     and no dialog state on the PBX. -->
+<scenario name="pbx-max-forwards">
+  <send retrans="500">
+    <![CDATA[
+      INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/UDP [local_ip]:[local_port];branch=z9hG4bKsipp-mf0
+      Max-Forwards: 0
+      From: <sip:alice@[remote_ip]:[remote_port]>;tag=sippalice-mf0
+      To: <sip:bob@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:alice@[local_ip]:[local_port]>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="483" timeout="8000">
+  </recv>
+
+  <!-- End of call. -->
+</scenario>

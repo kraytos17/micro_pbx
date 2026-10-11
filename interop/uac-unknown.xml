@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- S3: INVITE an unknown user. Expects 404 twice: the second identical
+     INVITE (same branch) must be served from the client-branch error cache
+     instead of hitting the registrar again. -->
+<scenario name="pbx-unknown-user">
+  <send retrans="500">
+    <![CDATA[
+      INVITE sip:nobody@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/UDP [local_ip]:[local_port];branch=z9hG4bKsipp-unknown
+      Max-Forwards: 70
+      From: <sip:alice@[remote_ip]:[remote_port]>;tag=sippalice-unk
+      To: <sip:nobody@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:alice@[local_ip]:[local_port]>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="404" timeout="8000">
+  </recv>
+
+  <!-- Same branch again. sipp's own transaction layer discards the replayed
+       second 404 (its INVITE transaction already completed), so this send
+       expects nothing: run.sh asserts the replay ran via the PBX log
+       ("INVITE retransmission detected"). -->
+  <send retrans="500">
+    <![CDATA[
+      INVITE sip:nobody@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/UDP [local_ip]:[local_port];branch=z9hG4bKsipp-unknown
+      Max-Forwards: 70
+      From: <sip:alice@[remote_ip]:[remote_port]>;tag=sippalice-unk
+      To: <sip:nobody@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:alice@[local_ip]:[local_port]>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <pause milliseconds="500"/>
+
+  <!-- End of call. -->
+</scenario>

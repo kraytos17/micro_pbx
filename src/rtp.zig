@@ -102,7 +102,7 @@ pub const Sessions = struct {
             .caller_rtp_port = caller_port,
             .callee_rtp_port = callee_port,
             .caller_ip = caller_ip,
-            .callee_ip = undefined,
+            .callee_ip = .{ .ip4 = net.Ip4Address.unspecified(0) },
             .caller_payload_type = caller_pt,
             .callee_payload_type = 0,
         };
@@ -304,4 +304,87 @@ test "RTP relay matches by IP and port, not port alone" {
     const second = try dest.recvFrom(&recv_buf);
     try std.testing.expectEqual(@as(usize, 15), second.data.len);
     try std.testing.expectEqualStrings(&packet, second.data);
+}
+
+test "RTP relay forwards callee to caller with intact bytes" {
+    var sessions = Sessions.init(std.testing.allocator);
+    defer sessions.deinit();
+
+    // Destination socket standing in for the caller side.
+    var dest = try transport.UdpSocket.init(std.testing.io, 0);
+    defer dest.deinit();
+    const dest_addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address.loopback(dest.socket.address.ip4.port) };
+
+    const callee_ip = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 20 }, .port = 5072 } };
+
+    _ = try sessions.createSession("call-rev", dest_addr.ip4.port, dest_addr, 0);
+    const session = sessions.getSession("call-rev").?;
+    session.callee_ip = callee_ip;
+    session.callee_rtp_port = 30000;
+
+    var relay = try transport.UdpSocket.init(std.testing.io, 0);
+    defer relay.deinit();
+
+    const packet = [_]u8{ 0x80, 0x08, 0xAB, 0xCD, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0xDE, 0xAD, 0xBE, 0xEF };
+
+    const callee_from = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 20 }, .port = 30000 } };
+    try handleRtpPacket(&packet, callee_from, &sessions, &relay);
+
+    var recv_buf: [64]u8 = undefined;
+    const received = try dest.recvFrom(&recv_buf);
+    try std.testing.expectEqual(@as(usize, packet.len), received.data.len);
+    try std.testing.expectEqualStrings(&packet, received.data);
+}
+
+test "RTP relay drops caller packet before callee SDP arrives" {
+    var sessions = Sessions.init(std.testing.allocator);
+    defer sessions.deinit();
+
+    const caller_ip = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 10 }, .port = 5070 } };
+    _ = try sessions.createSession("call-nocallee", 20000, caller_ip, 0);
+
+    // Fresh sessions carry the unspecified sentinel, never undefined memory.
+    const session = sessions.getSession("call-nocallee").?;
+    try std.testing.expectEqual(@as(u16, 0), session.callee_ip.ip4.port);
+
+    var relay = try transport.UdpSocket.init(std.testing.io, 0);
+    defer relay.deinit();
+
+    const packet = [_]u8{ 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const matching_from = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 10 }, .port = 20000 } };
+
+    // Must return normally (no send target exists) and leave the session alone.
+    try handleRtpPacket(&packet, matching_from, &sessions, &relay);
+    try std.testing.expectEqual(@as(u16, 0), session.callee_ip.ip4.port);
+
+    // Nothing was emitted toward the relay socket itself either.
+    var recv_buf: [64]u8 = undefined;
+    const res = relay.recvFromTimeout(&recv_buf, transport.pollTimeout());
+    try std.testing.expectError(error.Timeout, res);
+}
+
+test "RTP relay ignores packets from unknown sources" {
+    var sessions = Sessions.init(std.testing.allocator);
+    defer sessions.deinit();
+
+    const caller_ip = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 192, 168, 1, 10 }, .port = 5070 } };
+    _ = try sessions.createSession("call-unknown", 20000, caller_ip, 0);
+
+    var relay = try transport.UdpSocket.init(std.testing.io, 0);
+    defer relay.deinit();
+
+    const packet = [_]u8{ 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    const stranger = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address{ .bytes = .{ 10, 9, 9, 9 }, .port = 9999 } };
+
+    try handleRtpPacket(&packet, stranger, &sessions, &relay);
+}
+
+test "RTP header rejects bad version and short packets" {
+    var bad_version: [12]u8 = @splat(0);
+    bad_version[0] = 0x00; // version 0
+    try std.testing.expectError(error.InvalidVersion, Header.parse(&bad_version));
+
+    var short: [8]u8 = @splat(0);
+    short[0] = 0x80;
+    try std.testing.expectError(error.PacketTooShort, Header.parse(&short));
 }

@@ -195,6 +195,24 @@ pub const Pbx = struct {
         }
     }
 
+    /// Best-effort cache of a final error response under the caller's
+    /// branch, mirroring the 404 path. Logs and drops on OOM.
+    fn cacheErrorResponse(
+        self: *Pbx,
+        branch: []const u8,
+        method: msg.Method,
+        data: []u8,
+        to: std.Io.net.IpAddress,
+    ) void {
+        self.txn_layer.createNonInviteTransaction(branch, method, data, to) catch |err| {
+            log.err("error-cache create failed: {}", .{err});
+            return;
+        };
+        self.txn_layer.storeResponse(branch, method, data) catch |err| {
+            log.err("error-cache store failed: {}", .{err});
+        };
+    }
+
     fn onInvite(
         self: *Pbx,
         req: msg.Request,
@@ -204,6 +222,14 @@ pub const Pbx = struct {
     ) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
+
+        // Loop protection (RFC 3261) takes precedence over everything,
+        // including retransmission replay: a 0-hop request is answered here.
+        if ((req.max_forwards orelse 70) == 0) {
+            log.warn("INVITE {s} rejected: Max-Forwards exhausted", .{req.request_uri});
+            try proxy.sendResponse(&self.socket, from, resp_buf, 483, "Too Many Hops", req);
+            return;
+        }
 
         const txn_id: txn.TransactionId = .{ .branch = req.via_branch, .method = .INVITE };
         if (self.txn_layer.isRetransmission(txn_id)) {
@@ -218,25 +244,28 @@ pub const Pbx = struct {
 
         var call_ctx: call.Call = if (self.calls.get(req.call_id)) |existing| existing else .{ .caller_addr = from };
 
-        try call.putCall(&self.calls, self.allocator, req.call_id, call_ctx);
+        // A terminated dialog awaiting its BYE response is stale: a new
+        // INVITE reusing the Call-ID starts fresh instead of stalling.
+        if (call_ctx.state == .terminated) {
+            call.removeCall(&self.calls, self.allocator, req.call_id);
+            call_ctx = .{ .caller_addr = from };
+        }
+
+        // Stored on the success path below; 404s never create dialog state.
         if (call_ctx.state == .proceeding and call_ctx.callee_contact_addr == null) {
             const dest_aor = proxy.extractUri(req.request_uri);
             const contact = self.reg.lookup(dest_aor) orelse {
                 log.warn("INVITE {s} not found, sending 404", .{dest_aor});
-                // Generate branch for 404 response (RFC 3261)
-                const branch_404 = try proxy.generateBranch(self.allocator, self.io);
-                defer self.allocator.free(branch_404);
 
-                // Build 404 response
+                // Build 404 response (top Via echoed unchanged)
                 var response_buf: [2048]u8 = undefined;
-                const response_404 = try proxy.buildResponse(&response_buf, 404, "Not Found", req, branch_404);
+                const response_404 = try proxy.buildResponse(&response_buf, 404, "Not Found", req);
 
                 // Send the 404
-                try proxy.sendResponseWithBranch(&self.socket, from, resp_buf, 404, "Not Found", req, branch_404);
+                try proxy.sendResponseWithBranch(&self.socket, from, resp_buf, 404, "Not Found", req);
                 // Cache the 404 response for retransmissions using client's branch
                 try self.txn_layer.createNonInviteTransaction(req.via_branch, .INVITE, response_404, from);
                 try self.txn_layer.storeResponse(req.via_branch, .INVITE, response_404);
-
                 return;
             };
 
@@ -256,10 +285,9 @@ pub const Pbx = struct {
             const invite_result = try proxy.handleInvite(req, from, contact, &self.socket, self.pbx_addr, resp_buf, fwd_buf, arena.allocator(), self.io);
 
             try self.txn_layer.createInviteTransaction(invite_result.branch, invite_result.forwarded, contact.address);
-
             if (call_ctx.invite_branch) |old| self.allocator.free(old);
-            call_ctx.invite_branch = self.allocator.dupe(u8, invite_result.branch) catch null;
 
+            call_ctx.invite_branch = self.allocator.dupe(u8, invite_result.branch) catch null;
             if (call_ctx.caller_via) |old| self.allocator.free(old);
             if (call_ctx.caller_from) |old| self.allocator.free(old);
             if (call_ctx.caller_to) |old| self.allocator.free(old);
@@ -271,7 +299,11 @@ pub const Pbx = struct {
             arena.allocator().free(invite_result.branch);
             try call.putCall(&self.calls, self.allocator, req.call_id, call_ctx);
         } else {
-            try proxy.sendResponse(&self.socket, from, resp_buf, 100, "Trying", req);
+            // Duplicate or in-dialog INVITE (call already tracked): absorb
+            // silently. Re-100ing feeds retransmit storms — real stacks keep
+            // Timer A running past provisionals — and risks aborting strict
+            // UAs with out-of-step responses.
+            log.debug("absorbed duplicate INVITE {s} branch {s}", .{ req.call_id, req.via_branch });
         }
     }
 
@@ -301,11 +333,9 @@ pub const Pbx = struct {
                 try self.rtp_sockets.append(self.allocator, callee_socket);
             }
         } else {
-            const branch = try proxy.generateBranch(self.allocator, self.io);
-            defer self.allocator.free(branch);
-            proxy.handleAck(req, from, &self.reg, &self.socket, self.pbx_addr, branch, fwd_buf) catch |err| {
-                log.err("handleAck error: {}", .{err});
-            };
+            // No dialog: nothing to acknowledge toward. Dropping avoids
+            // bouncing the ACK back to its sender.
+            log.debug("ACK for unknown call {s} from {}, dropping", .{ req.call_id, from });
         }
     }
 
@@ -333,7 +363,9 @@ pub const Pbx = struct {
 
             // Stop any Timer A retransmits of the original INVITE (no-op if gone).
             if (call_ctx.invite_branch) |b| self.txn_layer.removeTransaction(b, .INVITE);
-            call.removeCall(&self.calls, self.allocator, req.call_id);
+            // Media stops now, but the dialog entry stays until the BYE
+            // response arrives (see handleResponse) so the 200 is relayed
+            // to the right side instead of bouncing back to its sender.
             self.rtp_sessions.removeSession(req.call_id);
         } else {
             proxy.sendResponse(&self.socket, from, fwd_buf, 481, "Call Leg Does Not Exist", req) catch {};
@@ -402,6 +434,13 @@ pub const Pbx = struct {
         fwd_buf: []u8,
     ) void {
         log.debug("SIP RESPONSE: {} {s}", .{ resp.status_code, resp.reason_phrase });
+        // Responses to PBX-originated CANCELs terminate at this hop: the
+        // caller was already answered directly when its CANCEL arrived.
+        if (resp.cseq_method == .CANCEL) {
+            log.debug("dropping downstream CANCEL response {d}", .{resp.status_code});
+            return;
+        }
+
         const dest_addr = if (self.calls.get(resp.call_id)) |c| c.caller_addr else from;
         if (self.calls.getPtr(resp.call_id)) |call_ctx| {
             switch (msg.ResponseClass.of(resp.status_code)) {
@@ -446,7 +485,14 @@ pub const Pbx = struct {
                         self.txn_layer.storeResponse(resp.via_branch, resp.cseq_method, data) catch |err| {
                             log.err("storeResponse failed: {}", .{err});
                         };
+
                         self.txn_layer.setCompleted(resp.via_branch, resp.cseq_method);
+                        // A terminating dialog ends when its BYE is answered.
+                        if (call_ctx.state == .terminated) {
+                            log.info("call {s} removed on BYE response", .{resp.call_id});
+                            call.removeCall(&self.calls, self.allocator, resp.call_id);
+                            self.rtp_sessions.removeSession(resp.call_id);
+                        }
                     }
                 },
                 .redirect, .client_error, .server_error, .global_error => {
@@ -462,6 +508,11 @@ pub const Pbx = struct {
                         };
 
                         self.txn_layer.setCompleted(resp.via_branch, resp.cseq_method);
+                        // Cache under the caller's branch too, so a caller
+                        // INVITE retransmit replays instead of re-forwarding.
+                        if (resp.via_branch2.len > 0) {
+                            self.cacheErrorResponse(resp.via_branch2, resp.cseq_method, data, dest_addr);
+                        }
                         call.removeCall(&self.calls, self.allocator, resp.call_id);
                     } else if (call_ctx.state != .terminated) {
                         call_ctx.state = .terminated;
@@ -475,6 +526,11 @@ pub const Pbx = struct {
                         };
 
                         self.txn_layer.setCompleted(resp.via_branch, resp.cseq_method);
+                        // Cache under the caller's branch too, so a caller
+                        // INVITE retransmit replays instead of re-forwarding.
+                        if (resp.via_branch2.len > 0) {
+                            self.cacheErrorResponse(resp.via_branch2, resp.cseq_method, data, dest_addr);
+                        }
                         call.removeCall(&self.calls, self.allocator, resp.call_id);
                     }
                 },
@@ -613,6 +669,18 @@ test "e2e full call flow REGISTER INVITE 180 200 ACK BYE" {
         "Content-Length: 0\r\n" ++
         "\r\n");
     try server.onBye(bye_req, test_alice_addr, &fwd_buf);
+    // Dialog lingers as terminated until the BYE is answered...
+    try std.testing.expect(server.calls.get(call_id).?.state == .terminated);
+
+    // ...and the 200 to BYE relays to the caller and removes the dialog.
+    try deliverResponse(&server, "SIP/2.0 200 OK\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbye1resp\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-1\r\n" ++
+        "CSeq: 2 BYE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", test_bob_addr, &fwd_buf);
     try std.testing.expect(server.calls.get(call_id) == null);
 }
 
@@ -636,16 +704,15 @@ test "e2e INVITE unknown user 404 and retransmission cache" {
         "\r\n", .{}) catch unreachable;
     const req = try parseRequest(raw);
     try server.onInvite(req, test_alice_addr, &resp_buf, &fwd_buf);
-    try std.testing.expect(server.calls.get("call-404@127.0.0.1") != null);
-    // 404 cached under client branch
+    // 404s create no dialog state...
+    try std.testing.expect(server.calls.get("call-404@127.0.0.1") == null);
+    // ...but the 404 is cached under the client branch...
     const cached_txn = server.txn_layer.getTransaction("z9hG4bK404", .INVITE).?;
     try std.testing.expect(cached_txn.response_buf != null);
 
-    // Retransmission: same branch replays cached 404, no new call mutation
-    const before = server.calls.get("call-404@127.0.0.1");
+    // ...so a retransmission replays the cached 404 with no call mutation.
     try server.onInvite(req, test_alice_addr, &resp_buf, &fwd_buf);
-    const after = server.calls.get("call-404@127.0.0.1");
-    try std.testing.expect(before != null and after != null);
+    try std.testing.expect(server.calls.get("call-404@127.0.0.1") == null);
 }
 
 test "e2e CANCEL then 2xx race goes to answered" {
@@ -1007,6 +1074,84 @@ test "e2e BYE removes the INVITE client transaction" {
         "Content-Length: 0\r\n" ++
         "\r\n");
     try server.onBye(bye_req, test_alice_addr, &fwd_buf);
+    // INVITE transaction gone, dialog kept as terminated...
+    try std.testing.expectEqual(@as(usize, 0), server.txn_layer.map.count());
+    try std.testing.expect(server.calls.get(call_id).?.state == .terminated);
+
+    // ...until the 200 to BYE arrives and removes it.
+    try deliverResponse(&server, "SIP/2.0 200 OK\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbyetxnresp\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-byetxn\r\n" ++
+        "CSeq: 2 BYE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", test_bob_addr, &fwd_buf);
     try std.testing.expect(server.calls.get(call_id) == null);
+}
+
+test "e2e 486 retransmit replays cached error instead of re-forwarding" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+
+    const call_id = "call-486re";
+    try inviteBob(&server, call_id, "z9hG4bKre", test_alice_addr, false, &resp_buf, &fwd_buf);
+    const invite_branch = server.calls.get(call_id).?.invite_branch.?;
+    try std.testing.expectEqual(@as(usize, 1), server.txn_layer.map.count());
+
+    // 486 with both Vias: PBX branch first, caller branch second.
+    var raw_buf: [1024]u8 = undefined;
+    const raw = std.fmt.bufPrint(&raw_buf, "SIP/2.0 486 Busy Here\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch={s}\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKre\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-486re\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", .{invite_branch}) catch unreachable;
+    try deliverResponse(&server, raw, test_bob_addr, &fwd_buf);
+
+    // Call torn down; completed invite txn + client-branch error cache remain.
+    try std.testing.expect(server.calls.get(call_id) == null);
+    try std.testing.expectEqual(@as(usize, 2), server.txn_layer.map.count());
+    try std.testing.expect(server.txn_layer.getTransaction("z9hG4bKre", .INVITE).?.response_buf != null);
+
+    // Caller retransmits the INVITE: replay, no re-forward, no new state.
+    try inviteBob(&server, call_id, "z9hG4bKre", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id) == null);
+    try std.testing.expectEqual(@as(usize, 2), server.txn_layer.map.count());
+}
+
+test "e2e INVITE with exhausted Max-Forwards gets no dialog" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+
+    var raw_buf: [1024]u8 = undefined;
+    const raw = std.fmt.bufPrint(&raw_buf, "INVITE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKmf0\r\n" ++
+        "Max-Forwards: 0\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>\r\n" ++
+        "Call-ID: call-mf0@127.0.0.1\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", .{}) catch unreachable;
+    const req = try parseRequest(raw);
+    try server.onInvite(req, test_alice_addr, &resp_buf, &fwd_buf);
+
+    // 483 answered (send goes to loopback, unobserved); nothing stored.
+    try std.testing.expect(server.calls.get("call-mf0@127.0.0.1") == null);
     try std.testing.expectEqual(@as(usize, 0), server.txn_layer.map.count());
 }

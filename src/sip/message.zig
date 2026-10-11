@@ -57,6 +57,9 @@ pub const Request = struct {
     request_uri: []const u8,
     via: []const u8,
     via_branch: []const u8,
+    /// Branch of the second Via, if present. On responses arriving at the
+    /// PBX this is the caller's branch (ours is first); requests carry one.
+    via_branch2: []const u8,
     from: []const u8,
     from_tag: []const u8,
     to: []const u8,
@@ -77,6 +80,9 @@ pub const Response = struct {
     reason_phrase: []const u8,
     via: []const u8,
     via_branch: []const u8,
+    /// Branch of the second Via, if present (the caller's, on responses
+    /// arriving at the PBX whose first Via is ours).
+    via_branch2: []const u8,
     from: []const u8,
     from_tag: []const u8,
     to: []const u8,
