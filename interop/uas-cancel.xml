@@ -31,7 +31,7 @@
       [last_From:]
       [last_To:];tag=sippbob1
       [last_Call-ID:]
-      CSeq: 1 INVITE
+      CSeq: 2 INVITE
       Content-Length: 0
 
     ]]>

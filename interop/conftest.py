@@ -60,12 +60,17 @@ def logs_dir():
 
 @pytest.fixture(scope="session")
 def pbx(logs_dir):
-    """Build, spawn the PBX, wait for readiness (bounded), teardown after."""
+    """Build, spawn the PBX, wait for readiness (bounded), teardown after.
+
+    The PBX loads interop/users.conf explicitly (same users as the seeds),
+    so every run exercises the file path live; unit tests cover the loader.
+    """
     subprocess.run(["zig", "build"], cwd=ROOT, check=True)
     log_path = logs_dir / "pbx.log"
     with open(log_path, "wb") as logf:
         proc = subprocess.Popen(
-            [str(ROOT / "zig-out" / "bin" / "micro_pbx")],
+            [str(ROOT / "zig-out" / "bin" / "micro_pbx"),
+             str(INT / "users.conf")],
             stdout=logf, stderr=subprocess.STDOUT)
         try:
             deadline = time.time() + 10
@@ -107,18 +112,19 @@ def run_sipp_uac(logs_dir, name, xml, timeout_s=30):
 
 
 @contextmanager
-def sipp_uas(logs_dir, name, xml, port):
+def sipp_uas(logs_dir, name, xml, port, extra=()):
     """Run a callee scenario in the background; always reaped.
 
     Yields the Popen handle; on exit waits (bounded) for its natural end,
     killing on hang so one stuck scenario can't wedge the suite. Callers
     must still assert returncode == 0 and green counters afterwards —
-    Popen alone can't tell pass from fail.
+    Popen alone can't tell pass from fail. `extra` appends raw sipp flags
+    (e.g. RTP echo/media pinning for media tests).
     """
     cmd = _sipp_base(xml, port, 60) + [
         "-trace_msg", "-message_file", str(logs_dir / f"{name}-uas-msg.log"),
         "-trace_err", "-error_file", str(logs_dir / f"{name}-uas-err.log"),
-        "-log_file", str(logs_dir / f"{name}-uas.log")]
+        "-log_file", str(logs_dir / f"{name}-uas.log")] + list(extra)
     with open(logs_dir / f"{name}-uas-out.txt", "wb") as out:
         proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT)
     try:

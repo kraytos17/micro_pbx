@@ -211,6 +211,12 @@ pub const TransactionLayer = struct {
     }
 
     /// Caches a response on an existing transaction for retransmission replies.
+    /// Marks the entry completed with a Timer-D deadline: cache entries are
+    /// server-side answer records, not client transactions — leaving them
+    /// trying would spontaneously retransmit the cached response on backoff
+    /// schedule (a stale 404 arriving mid-suite killed a strict wait once).
+    /// Replay reads response_buf regardless of state (isRetransmission is
+    /// map membership), so caching behavior is unchanged.
     pub fn storeResponse(
         self: *TransactionLayer,
         branch: []const u8,
@@ -226,7 +232,10 @@ pub const TransactionLayer = struct {
         if (entry.response_buf) |existing| {
             self.allocator.free(existing);
         }
+
         entry.response_buf = try self.allocator.dupe(u8, response_buf);
+        entry.state = .completed;
+        entry.next_fire_at_ms = nowMs(self.io) + timer_d_ms;
     }
 
     pub fn getTransaction(

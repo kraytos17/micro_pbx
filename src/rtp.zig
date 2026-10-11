@@ -152,6 +152,18 @@ pub const Sessions = struct {
         session.callee_payload_type = callee_pt;
     }
 
+    /// True while any session holds open relay sockets: the run loop must
+    /// wake on RTP cadence instead of sleeping to the next SIP timeout,
+    /// or media sits unread in kernel buffers between SIP events.
+    pub fn hasOpenRelays(self: *Sessions) bool {
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            const session = entry.value_ptr;
+            if (session.caller_sock != null or session.callee_sock != null) return true;
+        }
+        return false;
+    }
+
     pub fn removeSession(self: *Sessions, call_id: []const u8) void {
         if (self.sessions.getPtr(call_id)) |session| {
             if (session.caller_sock) |*sock| sock.deinit();
@@ -189,6 +201,11 @@ pub const Sessions = struct {
 /// are matched by exact UA endpoint; anything else is dropped. No map
 /// access here: the drain loop already holds the session, so routing is
 /// positional (O(1), no scans, no borrow conflicts).
+///
+/// Forwards emanate from the destination leg's relay socket when open, so
+/// replies (echo, RTCP) return to a polled socket instead of the SIP
+/// socket (where they would hit the SIP parser and die). Before ACK opens
+/// the sockets, early media falls back to the SIP socket one-way.
 pub fn relayPacket(
     packet: []const u8,
     from: net.IpAddress,
@@ -201,13 +218,23 @@ pub fn relayPacket(
     {
         if (session.callee_rtp_port != 0) {
             log.debug("RTP: Forwarding from caller to callee: {} bytes", .{packet.len});
-            try sip_socket.sendToPort(packet, session.callee_ip, session.callee_rtp_port);
+            const dest = net.IpAddress{ .ip4 = net.Ip4Address{ .bytes = session.callee_ip.ip4.bytes, .port = session.callee_rtp_port } };
+            if (session.callee_sock) |*sock| {
+                try sock.sendTo(packet, dest);
+            } else {
+                try sip_socket.sendTo(packet, dest);
+            }
         }
     } else if (std.mem.eql(u8, &from.ip4.bytes, &session.callee_ip.ip4.bytes) and
         from.ip4.port == session.callee_rtp_port)
     {
         log.debug("RTP: Forwarding from callee to caller: {} bytes", .{packet.len});
-        try sip_socket.sendToPort(packet, session.caller_ip, session.caller_rtp_port);
+        const dest = net.IpAddress{ .ip4 = net.Ip4Address{ .bytes = session.caller_ip.ip4.bytes, .port = session.caller_rtp_port } };
+        if (session.caller_sock) |*sock| {
+            try sock.sendTo(packet, dest);
+        } else {
+            try sip_socket.sendTo(packet, dest);
+        }
     }
 }
 
@@ -518,4 +545,26 @@ test "RTP relay end-to-end through session sockets, mismatched UA ports" {
     sessions.drain(&out, &rtp_buf);
     const got2 = try caller.recvFromTimeout(&recv_buf, transport.timeoutMs(2000));
     try std.testing.expectEqualStrings(&pkt2, got2.data);
+}
+
+test "hasOpenRelays tracks relay socket lifetime" {
+    const io = std.testing.io;
+    var sessions = Sessions.init(std.testing.allocator);
+    defer sessions.deinit();
+
+    try std.testing.expect(!sessions.hasOpenRelays());
+
+    const loopback = std.Io.net.Ip4Address.loopback(0);
+    _ = try sessions.createSession("call-relayq", 20000, .{ .ip4 = loopback }, 0);
+    // Session exists but no sockets yet (they open on ACK): still quiet.
+    try std.testing.expect(!sessions.hasOpenRelays());
+
+    // Ephemeral sockets stand in for relay binds (no fixed ports in tests).
+    const session = sessions.getSession("call-relayq").?;
+    session.caller_sock = try transport.UdpSocket.init(io, 0);
+    session.callee_sock = try transport.UdpSocket.init(io, 0);
+    try std.testing.expect(sessions.hasOpenRelays());
+
+    sessions.removeSession("call-relayq");
+    try std.testing.expect(!sessions.hasOpenRelays());
 }

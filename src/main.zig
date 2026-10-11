@@ -64,6 +64,19 @@ pub fn main(init: std.process.Init) !void {
     var server = try pbx.Pbx.init(gpa.allocator(), init.io, 5060);
     defer server.deinit();
 
+    // Credentials: explicit argv path, else ./users.conf, else the seeds
+    // from Pbx.init. A missing file is warn-and-continue;
+    // malformed lines are warn-skipped inside the loader.
+    var arg_it = std.process.Args.Iterator.init(init.minimal.args);
+    _ = arg_it.skip();
+
+    const users_path = arg_it.next() orelse "users.conf";
+    if (server.auth.loadUsersFile(users_path)) |loaded| {
+        log.info("loaded {d} users from {s}", .{ loaded, users_path });
+    } else |err| {
+        log.warn("users file {s} unreadable ({}), keeping seeded users", .{ users_path, err });
+    }
+
     log.info("PBX listening on 0.0.0.0:5060", .{});
     try server.run();
 }

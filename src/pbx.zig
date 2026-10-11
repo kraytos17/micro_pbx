@@ -18,6 +18,11 @@ const log = std.log.scoped(.main);
 /// Registrar sweep cadence: stale contacts linger at most this long past
 /// expiry when nobody looks them up. Tunable.
 pub const reg_sweep_interval_ms: i64 = 60_000;
+/// RTP poll quantum: while any relay session holds open sockets, the run
+/// loop wakes this often instead of sleeping to the next SIP timeout.
+/// 20ms matches voice packetization; idle PBXs (no open relays) still
+/// sleep full SIP deadlines.
+pub const rtp_poll_interval_ms: i64 = 20;
 
 /// A running PBX server: owns all mutable state and the dispatch loop.
 pub const Pbx = struct {
@@ -53,8 +58,8 @@ pub const Pbx = struct {
         };
 
         errdefer self.deinit();
-        // MVP credential store. Passwords must
-        // match the interop scenarios' -ap flags.
+        // Fallback credential store (main loads users.conf over these when
+        // present). Passwords must match interop/register.py's credentials.
         try self.auth.addUser("alice", "alicepass");
         try self.auth.addUser("bob", "bobpass");
         try self.auth.addUser("silent", "silentpass");
@@ -102,12 +107,17 @@ pub const Pbx = struct {
             }
 
             // Block on SIP until the next transaction timer fires, across
-            // both the server cache and dialog client transactions.
-            const sip_timeout = transport.timeoutMs(@min(
+            // both the server cache and dialog client transactions — but
+            // never longer than the RTP quantum while media may be flowing,
+            // or relayed packets sit unread between SIP events.
+            var sleep_ms: i64 = @min(
                 self.txn_layer.nextTimeout(),
                 call.nextDialogTimeout(&self.calls, now_ms),
-            ));
-            const result = self.socket.recvFromTimeout(&recv_buf, sip_timeout) catch |err| {
+            );
+            if (self.rtp_sessions.hasOpenRelays()) {
+                sleep_ms = @min(sleep_ms, rtp_poll_interval_ms);
+            }
+            const result = self.socket.recvFromTimeout(&recv_buf, transport.timeoutMs(sleep_ms)) catch |err| {
                 if (err == error.Timeout) {
                     self.handleTimeout();
                     continue;
@@ -313,6 +323,19 @@ pub const Pbx = struct {
         const call_ctx: call.Call = if (dlg_ptr) |d| d.call else .{ .caller_addr = from };
         // Stored on the success path below; 404s never create dialog state.
         if (call_ctx.state == .proceeding and call_ctx.callee_contact_addr == null) {
+            // INVITE authentication, challenge-first like REGISTER: unknown
+            // users 401 here and never reach the lookup below (no user
+            // enumeration). Duplicates and in-dialog INVITEs take the absorb
+            // branch instead and skip this — a Timer-A retransmit carries a
+            // consumed nonce and must not re-challenge.
+            const username = self.auth.verifyRequest(req) catch |err| {
+                const stale = err == error.StaleNonce;
+                if (stale) log.info("stale nonce for {s}, re-challenging", .{req.request_uri});
+                try proxy.sendUnauthorized(&self.socket, from, &self.auth, resp_buf, req, self.allocator, stale);
+                return;
+            };
+
+            log.debug("INVITE {s} authenticated as {s}", .{ req.request_uri, username });
             const dest_aor = proxy.extractUri(req.request_uri);
             const contact = self.reg.lookup(dest_aor) orelse {
                 log.warn("INVITE {s} not found, sending 404", .{dest_aor});
@@ -519,6 +542,18 @@ pub const Pbx = struct {
         }
     }
 
+    /// In-dialog response destination: the request path in reverse.
+    /// INVITE answers always go caller-ward (dest_addr), but a response to
+    /// a callee-originated request (BYE from bob) must go back to the
+    /// callee. Same leg-flip as onBye; shared by the 2xx and post-teardown
+    /// non-INVITE arms so the two can't diverge again.
+    fn responseDest(call_ctx: *const call.Call, from: std.Io.net.IpAddress) std.Io.net.IpAddress {
+        if (call.addressEqual(from, call_ctx.caller_addr)) {
+            return call_ctx.callee_contact_addr orelse from;
+        }
+        return call_ctx.caller_addr;
+    }
+
     fn handleResponse(
         self: *Pbx,
         resp: msg.Response,
@@ -581,17 +616,14 @@ pub const Pbx = struct {
                         }
                     } else {
                         // In-dialog non-INVITE responses travel the request
-                        // path in reverse: a callee-originated BYE is
-                        // answered toward the callee, not the caller. The
-                        // shared dest_addr default is caller-ward (correct
+                        // path in reverse (responseDest): a callee-originated
+                        // BYE is answered toward the callee, not the caller.
+                        // The shared dest_addr default is caller-ward (correct
                         // for INVITE answers only); using it here bounces
                         // the 200 back to its sender and the callee times
                         // out waiting (live callee-BYE interop failed on
-                        // exactly this). Same leg-flip as onBye.
-                        const peer_addr = if (call.addressEqual(from, call_ctx.caller_addr))
-                            call_ctx.callee_contact_addr orelse from
-                        else
-                            call_ctx.caller_addr;
+                        // exactly this).
+                        const peer_addr = responseDest(call_ctx, from);
                         proxy.handleResponse(resp, peer_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
                             log.err("handleResponse non-invite: {}", .{err});
                         };
@@ -642,6 +674,21 @@ pub const Pbx = struct {
                             self.cacheErrorResponse(resp.via_branch2, resp.cseq_method, data, dest_addr);
                         }
                         call.removeCall(&self.calls, self.allocator, resp.call_id);
+                    } else if (resp.cseq_method != .INVITE) {
+                        // Post-teardown non-INVITE final (e.g. a rejected
+                        // callee-BYE: onBye already terminated the dialog at
+                        // forward time). Route to the request sender like 2xx
+                        // and remove the dialog — but cache nothing: an
+                        // INVITE-response cache must never hold a BYE final.
+                        // Without this arm the response drops and the dialog
+                        // leaks (live callee-BYE-rejected interop).
+                        log.info("call {s} torn down on BYE final ({d} {s})", .{ resp.call_id, resp.status_code, resp.reason_phrase });
+                        proxy.handleResponse(resp, responseDest(call_ctx, from), from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
+                            log.err("handleResponse post-teardown: {}", .{err});
+                        };
+
+                        call.removeCall(&self.calls, self.allocator, resp.call_id);
+                        self.rtp_sessions.removeSession(resp.call_id);
                     }
                 },
             }
@@ -725,14 +772,23 @@ fn registerUser(pbx: *Pbx, name: []const u8, from: std.Io.net.IpAddress, resp_bu
     try registerHandshake(pbx, name, testPassword(name), from, resp_buf, call_id, 1, 3600);
 }
 
-fn inviteBob(pbx: *Pbx, call_id: []const u8, branch: []const u8, from: std.Io.net.IpAddress, with_sdp: bool, resp_buf: []u8, fwd_buf: []u8) !void {
+fn inviteHandshake(pbx: *Pbx, call_id: []const u8, branch: []const u8, from: std.Io.net.IpAddress, with_sdp: bool, resp_buf: []u8, fwd_buf: []u8) !void {
+    // Unit-test shortcut mirroring registerHandshake: issue a nonce straight
+    // from the server instead of a bare-INVITE round trip (dedicated tests
+    // cover the bare→401 leg). The authed leg is byte-real: built, parsed,
+    // and dispatched like wire traffic.
     const sdp_body =
         "v=0\r\n" ++
         "o=alice 123456 789 IN IP4 127.0.0.1\r\n" ++
         "s=Session\r\n" ++
         "c=IN IP4 127.0.0.1\r\n" ++
         "m=audio 20000 RTP/AVP 0\r\n";
-    var raw_buf: [1024]u8 = undefined;
+    const nonce = try pbx.auth.issueNonce();
+    const header = try auth.clientResponse(pbx.allocator, "alice", "alicepass", nonce[0..], "INVITE", "sip:bob@127.0.0.1:5060");
+    defer pbx.allocator.free(header);
+    var auth_line_buf: [512]u8 = undefined;
+    const auth_line = std.fmt.bufPrint(&auth_line_buf, "Authorization: {s}\r\n", .{header}) catch unreachable;
+    var raw_buf: [2048]u8 = undefined;
     const raw = std.fmt.bufPrint(&raw_buf, "INVITE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
         "Via: SIP/2.0/UDP 127.0.0.1:5060;branch={s}\r\n" ++
         "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
@@ -740,10 +796,11 @@ fn inviteBob(pbx: *Pbx, call_id: []const u8, branch: []const u8, from: std.Io.ne
         "Call-ID: {s}\r\n" ++
         "CSeq: 1 INVITE\r\n" ++
         "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "{s}" ++
         "Content-Type: application/sdp\r\n" ++
         "Content-Length: {d}\r\n" ++
         "\r\n" ++
-        "{s}", .{ branch, call_id, sdp_body.len, if (with_sdp) sdp_body else "" }) catch unreachable;
+        "{s}", .{ branch, call_id, auth_line, sdp_body.len, if (with_sdp) sdp_body else "" }) catch unreachable;
     const req = try parseRequest(raw);
     try pbx.onInvite(req, from, resp_buf, fwd_buf);
 }
@@ -771,7 +828,7 @@ test "e2e full call flow REGISTER INVITE 180 200 ACK BYE" {
     try std.testing.expect(server.reg.lookup("sip:bob") != null);
 
     const call_id = "call-1";
-    try inviteBob(&server, call_id, "z9hG4bKinv1", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try inviteHandshake(&server, call_id, "z9hG4bKinv1", test_alice_addr, false, &resp_buf, &fwd_buf);
     const call_ctx = server.calls.get(call_id).?.call;
     try std.testing.expect(call_ctx.state == .proceeding);
     try std.testing.expectEqual(test_bob_addr, call_ctx.callee_contact_addr.?);
@@ -835,7 +892,7 @@ test "e2e full call flow REGISTER INVITE 180 200 ACK BYE" {
     try std.testing.expect(server.calls.get(call_id) == null);
 }
 
-test "e2e INVITE unknown user 404 and retransmission cache" {
+test "e2e authed INVITE unknown user 404 and retransmission cache" {
     var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
     defer server.deinit();
 
@@ -843,7 +900,15 @@ test "e2e INVITE unknown user 404 and retransmission cache" {
     var fwd_buf: [4096]u8 = undefined;
     try registerUser(&server, "alice", test_alice_addr, &resp_buf);
 
-    var raw_buf: [1024]u8 = undefined;
+    // Alice authenticates (valid credential) but dials an unregistered AOR:
+    // auth passes, lookup misses, 404 answers. Bare INVITEs never reach
+    // here (401 first) — unknown users can't authenticate at all.
+    const nonce = try server.auth.issueNonce();
+    const header = try auth.clientResponse(server.allocator, "alice", "alicepass", nonce[0..], "INVITE", "sip:nobody@127.0.0.1:5060");
+    defer server.allocator.free(header);
+    var auth_line_buf: [512]u8 = undefined;
+    const auth_line = std.fmt.bufPrint(&auth_line_buf, "Authorization: {s}\r\n", .{header}) catch unreachable;
+    var raw_buf: [2048]u8 = undefined;
     const raw = std.fmt.bufPrint(&raw_buf, "INVITE sip:nobody@127.0.0.1:5060 SIP/2.0\r\n" ++
         "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK404\r\n" ++
         "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
@@ -851,8 +916,9 @@ test "e2e INVITE unknown user 404 and retransmission cache" {
         "Call-ID: call-404@127.0.0.1\r\n" ++
         "CSeq: 1 INVITE\r\n" ++
         "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "{s}" ++
         "Content-Length: 0\r\n" ++
-        "\r\n", .{}) catch unreachable;
+        "\r\n", .{auth_line}) catch unreachable;
     const req = try parseRequest(raw);
     try server.onInvite(req, test_alice_addr, &resp_buf, &fwd_buf);
     // 404s create no dialog state...
@@ -866,6 +932,131 @@ test "e2e INVITE unknown user 404 and retransmission cache" {
     try std.testing.expect(server.calls.get("call-404@127.0.0.1") == null);
 }
 
+test "e2e bare INVITE is challenged before lookup" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+
+    // No Authorization at all: 401, and crucially no dialog, no forward,
+    // no 404-cache entry — auth precedes everything but loop protection.
+    const req = try parseRequest("INVITE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbare401\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>\r\n" ++
+        "Call-ID: call-bare401\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onInvite(req, test_alice_addr, &resp_buf, &fwd_buf);
+    try std.testing.expect(server.calls.get("call-bare401") == null);
+    try std.testing.expect(server.txn_layer.getTransaction("z9hG4bKbare401", .INVITE) == null);
+}
+
+test "e2e INVITE with wrong password is challenged, not forwarded" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerUser(&server, "bob", test_bob_addr, &resp_buf);
+
+    const nonce = try server.auth.issueNonce();
+    const header = try auth.clientResponse(server.allocator, "alice", "wrongpass", nonce[0..], "INVITE", "sip:bob@127.0.0.1:5060");
+    defer server.allocator.free(header);
+    var auth_line_buf: [512]u8 = undefined;
+    const auth_line = std.fmt.bufPrint(&auth_line_buf, "Authorization: {s}\r\n", .{header}) catch unreachable;
+    var raw_buf: [2048]u8 = undefined;
+    const raw = std.fmt.bufPrint(&raw_buf, "INVITE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbadpass\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>\r\n" ++
+        "Call-ID: call-badpass\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "{s}" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", .{auth_line}) catch unreachable;
+    try server.onInvite(try parseRequest(raw), test_alice_addr, &resp_buf, &fwd_buf);
+    try std.testing.expect(server.calls.get("call-badpass") == null);
+}
+
+test "e2e INVITE unknown user is challenged, never 404" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+
+    // Nobody is seeded and holds no password: the bare INVITE 401s before
+    // lookup, so existence never leaks (same rule as REGISTER).
+    const req = try parseRequest("INVITE sip:nobody@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKunk401\r\n" ++
+        "From: <sip:nobody@127.0.0.1:5060>;tag=nobodyTag\r\n" ++
+        "To: <sip:nobody@127.0.0.1:5060>\r\n" ++
+        "Call-ID: call-unk401\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Contact: <sip:nobody@127.0.0.1>\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onInvite(req, test_alice_addr, &resp_buf, &fwd_buf);
+    try std.testing.expect(server.calls.get("call-unk401") == null);
+    try std.testing.expect(server.txn_layer.getTransaction("z9hG4bKunk401", .INVITE) == null);
+}
+
+test "e2e authed INVITE duplicate absorbs without re-forward" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    var bob_sock = try transport.UdpSocket.init(std.testing.io, 0);
+    defer bob_sock.deinit();
+    const bob_addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address.loopback(bob_sock.socket.address.ip4.port) };
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerHandshake(&server, "bob", "bobpass", bob_addr, &resp_buf, "bobreg@127.0.0.1", 1, 3600);
+    {
+        var drain_buf: [1024]u8 = undefined;
+        _ = try bob_sock.recvFromTimeout(&drain_buf, transport.timeoutMs(2000));
+        _ = try bob_sock.recvFromTimeout(&drain_buf, transport.timeoutMs(2000));
+    }
+
+    // Timer-A style duplicate: same branch/Call-ID/CSeq, and a junk
+    // Authorization that would 401 if it ever reached verification.
+    const call_id = "call-dupauth";
+    try inviteHandshake(&server, call_id, "z9hG4bKdupauth", test_alice_addr, false, &resp_buf, &fwd_buf);
+    {
+        var drain_buf: [2048]u8 = undefined;
+        const fwd = try bob_sock.recvFromTimeout(&drain_buf, transport.timeoutMs(2000));
+        try std.testing.expect(std.mem.find(u8, fwd.data, "INVITE sip:bob@") != null);
+    }
+    const dup = try parseRequest("INVITE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKdupauth\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>\r\n" ++
+        "Call-ID: call-dupauth\r\n" ++
+        "CSeq: 1 INVITE\r\n" ++
+        "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "Authorization: Digest username=\"alice\", response=\"junk\"\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onInvite(dup, test_alice_addr, &resp_buf, &fwd_buf);
+
+    // Absorbed: exactly one forward ever reached bob, dialog untouched.
+    {
+        var quiet_buf: [2048]u8 = undefined;
+        const res = bob_sock.recvFromTimeout(&quiet_buf, transport.timeoutMs(300));
+        try std.testing.expectError(error.Timeout, res);
+    }
+    try std.testing.expect(server.calls.get(call_id) != null);
+}
+
 test "e2e CANCEL then 2xx race goes to answered" {
     var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
     defer server.deinit();
@@ -876,7 +1067,7 @@ test "e2e CANCEL then 2xx race goes to answered" {
     try registerUser(&server, "bob", test_bob_addr, &resp_buf);
 
     const call_id = "call-race";
-    try inviteBob(&server, call_id, "z9hG4bKrace", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try inviteHandshake(&server, call_id, "z9hG4bKrace", test_alice_addr, false, &resp_buf, &fwd_buf);
     try std.testing.expect(server.calls.get(call_id).?.call.state == .proceeding);
 
     const cancel_req = try parseRequest("CANCEL sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
@@ -912,7 +1103,7 @@ test "e2e CANCEL then 487 terminates and removes call" {
     try registerUser(&server, "bob", test_bob_addr, &resp_buf);
 
     const call_id = "call-487";
-    try inviteBob(&server, call_id, "z9hG4bK487", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try inviteHandshake(&server, call_id, "z9hG4bK487", test_alice_addr, false, &resp_buf, &fwd_buf);
 
     const cancel_req = try parseRequest("CANCEL sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
         "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKcancel2\r\n" ++
@@ -959,7 +1150,7 @@ test "e2e RTP session created on INVITE with SDP, sockets opened on ACK" {
     try registerUser(&server, "bob", test_bob_addr, &resp_buf);
 
     const call_id = "call-rtp";
-    try inviteBob(&server, call_id, "z9hG4bKrtp", test_alice_addr, true, &resp_buf, &fwd_buf);
+    try inviteHandshake(&server, call_id, "z9hG4bKrtp", test_alice_addr, true, &resp_buf, &fwd_buf);
 
     const session = server.rtp_sessions.getSession(call_id).?;
     try std.testing.expectEqual(@as(u16, 20000), session.caller_rtp_port);
@@ -1150,7 +1341,7 @@ test "e2e handleTimeout retransmits overdue INVITE transaction" {
     try registerUser(&server, "bob", test_bob_addr, &resp_buf);
 
     const call_id = "call-timer";
-    try inviteBob(&server, call_id, "z9hG4bKtimer", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try inviteHandshake(&server, call_id, "z9hG4bKtimer", test_alice_addr, false, &resp_buf, &fwd_buf);
     const dlg = server.calls.getPtr(call_id).?;
     try std.testing.expect(dlg.invite_txn != null);
 
@@ -1174,7 +1365,7 @@ test "e2e Timer B expiry sends 408 and tears down the call" {
     try registerUser(&server, "bob", test_bob_addr, &resp_buf);
 
     const call_id = "call-timeout";
-    try inviteBob(&server, call_id, "z9hG4bKtimeout", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try inviteHandshake(&server, call_id, "z9hG4bKtimeout", test_alice_addr, false, &resp_buf, &fwd_buf);
     try std.testing.expect(server.calls.get(call_id).?.call.state == .proceeding);
 
     // Backdate the forwarded-INVITE transaction past 64*T1 and force it
@@ -1203,7 +1394,7 @@ test "e2e 2xx removes the INVITE client transaction" {
     try registerUser(&server, "bob", test_bob_addr, &resp_buf);
 
     const call_id = "call-2xx";
-    try inviteBob(&server, call_id, "z9hG4bK2xx", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try inviteHandshake(&server, call_id, "z9hG4bK2xx", test_alice_addr, false, &resp_buf, &fwd_buf);
     const invite_branch = server.calls.get(call_id).?.call.invite_branch.?;
 
     var raw_buf: [1024]u8 = undefined;
@@ -1238,7 +1429,7 @@ test "e2e 486 completes the transaction and Timer D sweeps it" {
     try registerUser(&server, "bob", test_bob_addr, &resp_buf);
 
     const call_id = "call-busy";
-    try inviteBob(&server, call_id, "z9hG4bKbusy", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try inviteHandshake(&server, call_id, "z9hG4bKbusy", test_alice_addr, false, &resp_buf, &fwd_buf);
     // Own the branch: handleResponse tears down the call (freeing the
     // map-owned slice) before we look the transaction up below.
     const invite_branch = try std.testing.allocator.dupe(u8, server.calls.get(call_id).?.call.invite_branch.?);
@@ -1280,7 +1471,7 @@ test "e2e BYE removes the INVITE client transaction" {
     try registerUser(&server, "bob", test_bob_addr, &resp_buf);
 
     const call_id = "call-byetxn";
-    try inviteBob(&server, call_id, "z9hG4bKbyetxn", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try inviteHandshake(&server, call_id, "z9hG4bKbyetxn", test_alice_addr, false, &resp_buf, &fwd_buf);
     try std.testing.expect(server.calls.get(call_id).?.invite_txn != null);
 
     const bye_req = try parseRequest("BYE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
@@ -1308,6 +1499,70 @@ test "e2e BYE removes the INVITE client transaction" {
     try std.testing.expect(server.calls.get(call_id) == null);
 }
 
+test "e2e rejected callee-BYE routes to callee and removes dialog" {
+    var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
+    defer server.deinit();
+
+    // Bob listens on an ephemeral loopback port so the rejected-BYE forward
+    // is observable off the wire (fixed test_bob_addr has no socket).
+    var bob_sock = try transport.UdpSocket.init(std.testing.io, 0);
+    defer bob_sock.deinit();
+    const bob_addr = std.Io.net.IpAddress{ .ip4 = std.Io.net.Ip4Address.loopback(bob_sock.socket.address.ip4.port) };
+
+    var resp_buf: [4096]u8 = undefined;
+    var fwd_buf: [4096]u8 = undefined;
+    try registerUser(&server, "alice", test_alice_addr, &resp_buf);
+    try registerHandshake(&server, "bob", "bobpass", bob_addr, &resp_buf, "bobreg@127.0.0.1", 1, 3600);
+    {
+        var drain_buf: [1024]u8 = undefined;
+        _ = try bob_sock.recvFromTimeout(&drain_buf, transport.timeoutMs(2000));
+        _ = try bob_sock.recvFromTimeout(&drain_buf, transport.timeoutMs(2000));
+    }
+
+    const call_id = "call-byereject";
+    try inviteHandshake(&server, call_id, "z9hG4bKbyereject", test_alice_addr, false, &resp_buf, &fwd_buf);
+    // Drain the forwarded INVITE so the next read sees the rejected-BYE
+    // forward (bob's socket collects everything addressed to it).
+    {
+        var drain_buf: [1024]u8 = undefined;
+        _ = try bob_sock.recvFromTimeout(&drain_buf, transport.timeoutMs(2000));
+    }
+
+    // Callee hangs up: BYE from bob terminates at forward time, dialog kept.
+    const bye_req = try parseRequest("BYE sip:alice@127.0.0.1:5060 SIP/2.0\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbyereject1\r\n" ++
+        "From: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "To: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "Call-ID: call-byereject\r\n" ++
+        "CSeq: 1 BYE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    try server.onBye(bye_req, bob_addr, &fwd_buf);
+    try std.testing.expect(server.calls.get(call_id).?.call.state == .terminated);
+
+    // No cached INVITE response exists yet; the txn table is quiet.
+    try std.testing.expect(server.calls.get(call_id).?.invite_txn == null or
+        server.calls.get(call_id).?.invite_txn.?.response_buf == null);
+    const txns_before = server.txn_layer.map.count();
+
+    // Caller rejects the BYE: 403 from alice must reach bob (not bounce to
+    // alice), remove the dialog, and cache nothing.
+    try deliverResponse(&server, "SIP/2.0 403 Forbidden\r\n" ++
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbyerejectresp\r\n" ++
+        "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
+        "To: <sip:bob@127.0.0.1:5060>;tag=bobTag\r\n" ++
+        "Call-ID: call-byereject\r\n" ++
+        "CSeq: 1 BYE\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", test_alice_addr, &fwd_buf);
+
+    var recv_buf: [2048]u8 = undefined;
+    const got = try bob_sock.recvFromTimeout(&recv_buf, transport.timeoutMs(2000));
+    try std.testing.expect(std.mem.find(u8, got.data, "SIP/2.0 403") != null);
+    try std.testing.expect(server.calls.get(call_id) == null);
+    try std.testing.expectEqual(txns_before, server.txn_layer.map.count());
+}
+
 test "e2e forwarded INVITE carries PBX-rewritten SDP" {
     var server = try Pbx.init(std.testing.allocator, std.testing.io, 0);
     defer server.deinit();
@@ -1331,7 +1586,7 @@ test "e2e forwarded INVITE carries PBX-rewritten SDP" {
     }
 
     const call_id = "call-sdpfwd";
-    try inviteBob(&server, call_id, "z9hG4bKsdpfwd", test_alice_addr, true, &resp_buf, &fwd_buf);
+    try inviteHandshake(&server, call_id, "z9hG4bKsdpfwd", test_alice_addr, true, &resp_buf, &fwd_buf);
 
     // Read what the callee actually received off the wire.
     var recv_buf: [2048]u8 = undefined;
@@ -1357,7 +1612,7 @@ test "e2e 486 retransmit replays cached error instead of re-forwarding" {
     try registerUser(&server, "bob", test_bob_addr, &resp_buf);
 
     const call_id = "call-486re";
-    try inviteBob(&server, call_id, "z9hG4bKre", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try inviteHandshake(&server, call_id, "z9hG4bKre", test_alice_addr, false, &resp_buf, &fwd_buf);
     const invite_branch = server.calls.get(call_id).?.call.invite_branch.?;
     try std.testing.expect(server.calls.get(call_id).?.invite_txn != null);
 
@@ -1380,7 +1635,7 @@ test "e2e 486 retransmit replays cached error instead of re-forwarding" {
     try std.testing.expect(server.txn_layer.getTransaction("z9hG4bKre", .INVITE).?.response_buf != null);
 
     // Caller retransmits the INVITE: replay, no re-forward, no new state.
-    try inviteBob(&server, call_id, "z9hG4bKre", test_alice_addr, false, &resp_buf, &fwd_buf);
+    try inviteHandshake(&server, call_id, "z9hG4bKre", test_alice_addr, false, &resp_buf, &fwd_buf);
     try std.testing.expect(server.calls.get(call_id) == null);
     try std.testing.expectEqual(@as(usize, 1), server.txn_layer.map.count());
 }
@@ -1436,15 +1691,24 @@ test "e2e INVITE past the dialog cap gets 503" {
     }
     try std.testing.expectEqual(call.max_dialogs, server.calls.count());
 
-    const req = try parseRequest("INVITE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
+    // Authenticated (overload is checked after auth): the new call must 503
+    // while the table is full.
+    const nonce = try server.auth.issueNonce();
+    const header = try auth.clientResponse(server.allocator, "alice", "alicepass", nonce[0..], "INVITE", "sip:bob@127.0.0.1:5060");
+    defer server.allocator.free(header);
+    var auth_line_buf: [512]u8 = undefined;
+    const auth_line = std.fmt.bufPrint(&auth_line_buf, "Authorization: {s}\r\n", .{header}) catch unreachable;
+    var cap_buf: [2048]u8 = undefined;
+    const req = try parseRequest(std.fmt.bufPrint(&cap_buf, "INVITE sip:bob@127.0.0.1:5060 SIP/2.0\r\n" ++
         "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKcap503\r\n" ++
         "From: <sip:alice@127.0.0.1:5060>;tag=aliceTag\r\n" ++
         "To: <sip:bob@127.0.0.1:5060>\r\n" ++
         "Call-ID: call-cap503\r\n" ++
         "CSeq: 1 INVITE\r\n" ++
         "Contact: <sip:alice@127.0.0.1>\r\n" ++
+        "{s}" ++
         "Content-Length: 0\r\n" ++
-        "\r\n");
+        "\r\n", .{auth_line}) catch unreachable);
     try server.onInvite(req, caller_addr, &resp_buf, &fwd_buf);
 
     // 503 answered on the wire; no dialog stored.

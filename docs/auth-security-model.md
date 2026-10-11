@@ -22,9 +22,8 @@ never beside the verifier store.
 
 ## Challenge hygiene
 - **Single-use nonces.** Each 401 mints a nonce; a correct answer consumes
-  it. Replays get a fresh 401 (interop `test_register_wrong_password_fails`
-  exercises the failure path live; full nonce-replay coverage is future
-  test work).
+  it. Replays get a fresh 401, proven live (`test_register_nonce_replay_fails`
+  resends a captured Authorization byte-identical and gets 401).
 - **30s TTL + sweeper** (`nonce_ttl_secs`, `src/auth.zig:21`; sweep inline
   at verify, `src/auth.zig:216-226`). Stolen challenges rot fast.
 - **1024-entry cap** (`max_nonces`, `src/auth.zig:25`; arbitrary entries
@@ -54,7 +53,15 @@ honest clients with clock skew retry instead of failing.
   without TLS is observer-readable challenge/response (offline dictionary
   attacks apply to weak passwords). Deployment behind a VPN or trusted
   LAN is assumed, not enforced.
-- **Seeded credentials** (`alice`/`bob`/`silent`, `src/pbx.zig:58-60`).
-  No password file yet (roadmap); credential rotation means a rebuild.
-- **REGISTER-only auth.** INVITEs are unauthenticated until the roadmap's
-  407 path lands; the PBX currently trusts the loopback for dialog setup.
+- **File-backed credentials, seeds as fallback.** `main` loads
+  `user:password` lines from an argv path (else `./users.conf`) through
+  `Auth.loadUsersFile`, which seeds via `addUser`, so the HA1-only
+  invariant holds for file users too. Missing file warns and keeps the
+  `Pbx.init` seeds (`alice`/`bob`/`silent`); malformed lines warn-skip.
+  Rotation still needs a restart (no hot-reload).
+- **REGISTER + INVITE challenged; all others open.** INVITEs authenticate
+  with 401 + `Authorization` (same machinery, method-agnostic verifier),
+  challenged before lookup so unknown users never reach the registrar.
+  ACK/BYE/CANCEL/OPTIONS/MESSAGE are unchallenged; CANCEL cannot be
+  challenged per RFC, and in-dialog requests ride the authenticated
+  INVITE's dialog. The PBX still trusts the loopback for everything else.

@@ -7,7 +7,8 @@ registration, call setup/teardown, instant messaging, and media relay
 ## Features
 
 - **SIP methods**: REGISTER, INVITE, ACK, BYE, CANCEL, OPTIONS, MESSAGE (RFC 3428).
-  In-dialog duplicate INVITEs are absorbed (second 100, no re-forward);
+  In-dialog duplicate INVITEs are absorbed silently (no re-forward, no
+  re-challenge);
   responses to PBX-originated CANCELs terminate at this hop; ACKs with no
   dialog are dropped.
 - **Digest authentication** (RFC 3261 + RFC 7616 `qop=auth`, `src/auth.zig`):
@@ -18,7 +19,12 @@ registration, call setup/teardown, instant messaging, and media relay
   unknown users and wrong passwords are indistinguishable (no user
   enumeration); stale nonces are explicitly re-challenged per RFC 3261
   (threat model: `docs/auth-security-model.md`).
-  Seeded users: `alice` / `bob` / `silent` (hardcoded; see Limitations).
+  REGISTER and INVITE are both challenged (401 + `Authorization`; INVITE
+  auth reuses `verifyRequest` unchanged). ACK/BYE/CANCEL/OPTIONS/MESSAGE
+  are not — CANCEL is unchallengeable per RFC.
+  Seeded users: `alice` / `bob` / `silent`, overridable via a users file
+  (`./micro_pbx [users.conf]` — `user:password` lines; missing file keeps
+  the seeds).
 - **Registrar** (`src/registrar.zig`): dual-key AOR lookup (username and
   `username@domain`) so calls route regardless of the domain/host the caller
   dialed. `Expires: 0` unregisters. Expiry is checked on lookup with a 60s
@@ -39,8 +45,11 @@ registration, call setup/teardown, instant messaging, and media relay
   SDP is present; SDP `c=`/`m=` is rewritten on both legs to point at the
   PBX; relay sockets open on ACK and are session-owned (closed exactly once
   by `removeSession`/`deinit`). Packets route positionally
-  (`relayPacket`/`drain`) and match on `(IP, port)` to prevent cross-talk
-  between concurrent calls. Sessions die on BYE/teardown; an unanswered
+  (`relayPacket`/`drain`) and match on exact `(IP, port)` endpoints to
+  prevent cross-talk between concurrent calls; forwards emanate from the
+  destination leg's relay socket so replies return to a polled socket.
+  Proven live end to end (`test_s9_rtp_relay`: byte-identical ordered
+  echoes both directions). Sessions die on BYE/teardown; an unanswered
   callee is the `0.0.0.0:0` sentinel.
 - **Transaction layer** (RFC 3261 timers, `src/sip/transaction.zig`): T1
   500ms with exponential backoff capped at T2 (4s); Timer B / F fire at
@@ -75,25 +84,25 @@ registration, call setup/teardown, instant messaging, and media relay
 ```sh
 zig build            # builds ./zig-out/bin/micro_pbx
 zig build run        # build and run the PBX
-zig build test       # run all 117 unit tests
+zig build test       # run all 125 unit tests
 ```
 
 The PBX listens on UDP `0.0.0.0:5060` by default
 (`Pbx.init(allocator, io, 5060)` in `src/main.zig`).
 
-### Unit tests (117)
+### Unit tests (125)
 
-`zig test src/main.zig`: 115 named tests plus 2 `refAllDecls` blocks:
+`zig test src/main.zig`: 123 named tests plus 2 `refAllDecls` blocks:
 
 | Module | Tests | Covers |
 |---|---|---|
 | `sip/parser.zig` | 20 | zero-copy parse, folded Via, 404 responses, SDP bodies |
-| `pbx.zig` | 20 (all e2e) | full dispatch lifecycle incl. CANCEL races, 404 cache, Timer B 408, Timer D sweep, overload 503, wrong-password stores nothing |
+| `pbx.zig` | 25 (all e2e) | full dispatch lifecycle incl. INVITE auth (bare/wrong/unknown/duplicate), CANCEL races, 404 cache, Timer B 408, Timer D sweep, overload 503, wrong-password stores nothing |
 | `sip/transaction.zig` | 14 | tick/retransmit/backoff cap, elapsed Timer B/F, `nextTimeout` lapse term, table-full |
 | `proxy.zig` | 13 | builders (byte-exact incl. 408/401/404), Via strip/fold, REGISTER/unregister, OPTIONS 200/404 |
 | `call.zig` | 12 | dialog table, arenas, timer helpers, dialog-cap |
-| `rtp.zig` | 11 | header parse, loopback relay both directions, session lifecycle |
-| `auth.zig` | 10 | MD5 vectors, qop/non-qop verify, single-use + TTL + cap eviction, HA1-only storage |
+| `rtp.zig` | 12 | header parse, loopback relay both directions, session lifecycle, relay-quantum predicate |
+| `auth.zig` | 12 | MD5 vectors, qop/non-qop verify, single-use + TTL + cap eviction, HA1-only storage, users-file load |
 | `registrar.zig` | 8 | dual-key lookup, expiry, unregister |
 | `transport.zig` | 4 | socket wrapper |
 | `sdp.zig` | 2 | parse + IP/port rewrite |
@@ -105,7 +114,7 @@ so they own loopback ports 5090/5092 — never run `zig test` concurrently
 with the interop suite, and never move test addresses into the interop
 port map (both sides document the reservation).
 
-### Live interop (SIPp + pytest, 13 scenarios)
+### Live interop (SIPp + pytest + Python callers, 16 scenarios)
 
 `./interop.sh` (root wrapper: checks for `uv`/`sipp`/`zig`, translates
 `--slow`, passes everything else to pytest):
@@ -128,20 +137,24 @@ format if a tool ever demands it).
 | `s1_register` / `s1_register_qop` | bare→401→authed→200 handshake, plain and `qop=auth` |
 | `register_wrong_password_fails` | bad credentials never yield 200 (negative control) |
 | `register_unknown_user_challenged` | unknown user gets 401 + nonce, never 404 (no enumeration, live) |
-| `s3_unknown` | unknown callee → 404 once; duplicate-INVITE replay asserted via PBX log (`retransmission detected`) |
-| `s7_max_forwards` | `Max-Forwards: 0` → 483, no dialog |
+| `register_nonce_replay_fails` | captured Authorization resent byte-identical → fresh 401 (single-use nonces, live) |
+| `invite_unknown_user_challenged` | unknown-user INVITE → 401 + nonce, never 404/forward (no enumeration, live) |
+| `s3_unregistered` | authed INVITE to unregistered-known → 404 once; duplicate replay via PBX log; Expires:0 setup + re-register |
+| `s7_max_forwards` | `Max-Forwards: 0` → 483, no dialog (unchallenged — loop protection precedes auth) |
 | `garbage_datagrams_ignored` | binary/truncated/empty datagrams → warn-only; PBX stays responsive, no error-log growth |
-| `unregister_then_unreachable` | `Expires: 0` deletes the contact → INVITE 404s; alice re-registered afterwards |
-| `s4_call_and_s5_absorb` | full call + mid-dialog duplicate INVITE absorbed: exactly 1 PBX Via branch at the UAS (no re-forward), BYE teardown |
-| `s6_cancel` | pre-answer CANCEL race → 487, dialog torn down |
-| `callee_bye` | mirror teardown: callee hangs up, caller answers 200 (caught a real routing bug; see Features) |
-| `s8_timer_b` (slow) | silent contact → 408 at 32.000s after the INVITE (Timer B), teardown |
+| `s4_call_and_s5_absorb` | Python authed caller + sipp UAS: handshake, storm duplicate absorbed (1 INVITE + 1 branch at UAS), BYE teardown |
+| `s6_cancel` | Python caller CANCELs while proceeding → 200-to-CANCEL + 487, teardown |
+| `callee_bye` | Python caller answers callee BYE with 200 |
+| `callee_bye_rejected` | caller rejects callee BYE with 403 → routed to callee, dialog removed (probe BYE gets 481), nothing cached |
+| `s9_rtp_relay` | live media loop: RTP to relay port from SDP port → echo UAS → byte-identical ordered echoes, both directions logged |
+| `s8_timer_b` (slow) | Python caller handshakes with silent contact then lingers: 408 at 32.000s after the forwarded leg (Timer B), teardown |
 | `no_errors` (always last) | zero `] error(` lines in the whole run's PBX log |
 
 How it works: the session `pbx` fixture rebuilds, spawns the PBX, polls
 `pbx.log` for readiness (bounded — fails fast instead of timing out every
 scenario against a dead socket), and terminates it afterwards. `register.py`
-is imported as a module for all REGISTER steps; per-run logs archive to
+is imported as a module for all REGISTER steps, `invite.py`'s `Dialog`
+drives all dialog callers (sipp can't compute digests); per-run logs archive to
 `interop/logs/<timestamp>/` with a `latest` symlink. `sipassert.py` parses
 sipp `-trace_msg` logs into structured messages (CRLF + folded-Via handled
 once) and gates on sipp's Successful/Failed counters. Never on exit
@@ -201,9 +214,12 @@ interop/
 ├── conftest.py        # PBX lifecycle, log archiving, sipp runners, log-growth asserts
 ├── register.py        # digest-auth REGISTER client (importable + CLI)
 ├── sipassert.py       # structured sipp-log parser + sipp counter gate
+├── invite.py          # digest-auth INVITE dialog driver (sipp can't do digests)
 ├── pyproject.toml     # pytest>=8 dev dependency, slow marker
 ├── uv.lock            # pinned tree (single source of truth)
-└── uac-*.xml / uas-*.xml  # SIPp caller/callee scenarios
+├── users.conf         # interop credentials (user:password lines, passed to the PBX)
+├── uac-mf0.xml        # sole surviving caller scenario (483 precedes auth)
+└── uas-*.xml          # SIPp callee scenarios (answer only, never authenticate)
 ```
 
 ### Layering
@@ -220,10 +236,12 @@ interop/
 ## Running
 
 ```sh
-./zig-out/bin/micro_pbx
+./zig-out/bin/micro_pbx [users.conf]
 ```
 
-Log output goes to stderr with color. Example:
+Optional argv path to a `user:password` credentials file (defaults to
+`./users.conf`; missing file warns and keeps seeded users). Log output
+goes to stderr with color. Example:
 
 ```
 [14:03:22.145] info(main): PBX listening on 0.0.0.0:5060
@@ -282,7 +300,7 @@ Two baresip instances (Alice, Bob) registering to the PBX, then a call.
   state (`transport.UdpSocket`, `Auth`, `Registrar`, `TransactionLayer`, call
   table, RTP sessions) and dispatches through `handleResponse` /
   `handleTimeout` / `on*` methods. `main.zig` is a 73-line bootstrap.
-- **E2E harness** in `pbx.zig` (20 tests) exercises the actual dispatch methods
+- **E2E harness** in `pbx.zig` (25 tests) exercises the actual dispatch methods
   with parsed SIP messages. Full coverage of the call lifecycle, CANCEL
   races, 404 caching, 408/Timer D expiry, overload 503, RTP session creation,
   and registration expiry. These tests emit real loopback UDP (hence the
@@ -299,9 +317,9 @@ Two baresip instances (Alice, Bob) registering to the PBX, then a call.
 ## Current Limitations
 
 - **Single-domain, IPv4, UDP only**: no TCP/TLS/SIPS, no IPv6, no SRTP
-- **Hardcoded credentials**: `alice`/`bob`/`silent` are seeded in `Pbx.init`;
-  no password config file yet (so INVITE-time auth is also future work;
-  only REGISTER is challenged)
+- **File-backed credentials, seeds as fallback**: `user:password` lines
+  from an argv path (else `./users.conf`); missing file warns and keeps the
+  `Pbx.init` seeds. Rotation needs a restart (no hot-reload).
 - **In-memory registrations**: lost on restart, no persistence
 - **Hardcoded relay IP** (`127.0.0.1`) in SDP rewriting and hardcoded SIP port
   5060: the PBX anchors media to loopback regardless of interface

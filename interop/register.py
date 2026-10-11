@@ -101,6 +101,56 @@ def bare_register_status(user, port, timeout=5,
         sock.close()
 
 
+def replay_authorization(user, password, port, timeout=5,
+                         host="127.0.0.1", pbx_port=5060):
+    """Full handshake, then resend the identical authed REGISTER bytes.
+
+    Returns (first_status, second_status, second_msg). Single-use nonces
+    mean the replay must fail: expect 200 the first time, 401 the second.
+    Same branch, Call-ID, CSeq, nonce and nc — a true capture-replay, sent
+    milliseconds apart so TTL expiry can't explain a rejection. Raises
+    RegisterError on timeout or if the first leg doesn't 200.
+    """
+    uri = f"sip:{user}@{host}:{pbx_port}"
+    call_id = f"pyreplay-{user}"
+    tag = os.urandom(4).hex()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((host, port))
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(build_register(user, f"z9hG4bKpyreplay1-{tag}", call_id,
+                                   1, port, None, 3600, host, pbx_port),
+                     (host, pbx_port))
+        try:
+            status, msg = recv_status(sock)
+        except TimeoutError:
+            raise RegisterError("timed out waiting for 401 challenge")
+        if not status.startswith("SIP/2.0 401"):
+            raise RegisterError(f"expected 401 challenge, got: {status}")
+        challenge = parse_www_auth(msg)
+        if challenge is None:
+            raise RegisterError("401 without parseable nonce")
+
+        authed = build_register(
+            user, f"z9hG4bKpyreplay2-{tag}", call_id, 2, port,
+            digest_response(user, password, challenge["realm"],
+                            challenge["nonce"], "REGISTER", uri, False),
+            3600, host, pbx_port)
+        try:
+            sock.sendto(authed, (host, pbx_port))
+            first, _ = recv_status(sock)
+            sock.sendto(authed, (host, pbx_port))
+            second, second_msg = recv_status(sock)
+        except TimeoutError:
+            raise RegisterError("timed out waiting for replay verdict")
+        if not first.startswith("SIP/2.0 200"):
+            raise RegisterError(f"expected 200 after auth, got: {first}")
+        return first, second, second_msg
+    finally:
+        sock.close()
+
+
 def register(user, password, port, expires=3600, use_qop=False, timeout=5,
              host="127.0.0.1", pbx_port=5060):
     """Bare-then-authed REGISTER handshake against the PBX.

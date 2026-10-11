@@ -329,8 +329,9 @@ pub fn sendResponseWithBranch(
     try socket.sendTo(w.buffered(), to);
 }
 
-/// Answers 401 with a fresh nonce challenge.
-fn sendUnauthorized(
+/// Answers 401 with a fresh nonce challenge. Shared by REGISTER and
+/// INVITE authentication (both challenge-first; see onInvite).
+pub fn sendUnauthorized(
     socket: *transport.UdpSocket,
     to: std.Io.net.IpAddress,
     authenticator: *auth.Auth,

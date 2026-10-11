@@ -39,12 +39,16 @@ INVITE (measured in interop logs), not 32–36s.
   (`e2e Timer B expiry sends 408`, `src/pbx.zig:1167`).
 - 2xx ends the INVITE client transaction with no Timer D (RFC 3261);
   486 completes it and Timer D sweeps it (unit-tested, `src/pbx.zig:1231`).
-- Duplicate INVITEs (same branch) are absorbed with a second 100 and never
+- Duplicate INVITEs (same branch) are absorbed silently and never
   re-forwarded. The S5 branch-cardinality assert proves it
   (`test_s4_call_and_s5_absorb`).
 - Non-INVITE finals are cached under the client branch (404 replay, S3);
   error caching degrades to warn-and-continue under table pressure rather
-  than failing the original response.
+  than failing the original response. Cache entries go `completed` with a
+  Timer-D deadline at store time: they are answer records, not client
+  transactions, and must never spontaneously retransmit (a timer-replayed
+  stale 404 once landed in a later test's socket mid-suite). Replay reads
+  `response_buf` regardless of state; sweep reaps at Timer D.
 - Table pressure: 512 transactions (`max_transactions`, `:26`) then
   `TransactionTableFull`; 512 dialogs (`max_dialogs`, `src/call.zig:63`)
   then 503 before any work (`src/pbx.zig:340`). 404s bypass the dialog

@@ -24,6 +24,9 @@ Fixed: the PBX routes by source address, so these are load-bearing:
 | 5063 | silent contact | nothing listens; must differ from 5061, or INVITEs route back to the caller |
 | 5070 | sipp callee (UAS) / registered-contact port | `UAS_PORT` |
 | 5090 / 5092 | unit-test peers | `test_alice_addr` / `test_bob_addr`, `src/pbx.zig:664-666` |
+| 20000 | Python caller RTP (bound by `MediaSocket`, matches offered SDP) | media must originate here (exact-endpoint match) |
+| 4000–4001 | sipp UAS media+RTCP (pinned via `-min/-max_rtp_port`) | must equal the hardcoded `m=audio 4000` (PBX matches declared ports) |
+| 10000+ | PBX relay ports (step 4, wrap 60000) | advertised in rewritten SDP, learned from 200's `m=` |
 
 Both sides carry reservation comments; update both if the map changes.
 
@@ -41,12 +44,17 @@ Both sides carry reservation comments; update both if the map changes.
 ## Scenario-author checklist
 - [ ] Register via `register()` (imported) before starting the UAS;
       foreground order, then `sleep(1)` after UAS spawn.
-- [ ] New dialog needs a new Call-ID (sipp `[call_id]`) and fresh branch
-      values. Never reuse another scenario's.
+- [ ] Dialog callers go through `invite.Dialog` (sipp can't do digests):
+      handshake (bare CSeq 1 → 401 → authed CSeq 2), then drive.
+- [ ] ACK/CANCEL echo the *answered* INVITE's CSeq (2 after the 401 dance,
+      never 1: sipp aborts on mismatch).
+      Fresh in-dialog requests bump as usual (BYE CSeq 3).
+- [ ] New dialog needs a new Call-ID and fresh branch values. Never reuse
+      another scenario's.
 - [ ] UAS `recv` timeouts ≥ 15s for INVITE (PBX-side work happens first);
       8s is fine for in-dialog steps.
 - [ ] No `<pause/>` before a `recv` (tied-pause race); keep trailing pauses
-      as regression tripwires.
+      as regression tripwires (`wait_bye` is strict for the same reason).
 - [ ] Teardown assert (`terminated (…)`) around every dialog test.
 - [ ] `test_no_errors` stays last in `test_interop.py`: file order is run
       order, and it judges the whole run's log.

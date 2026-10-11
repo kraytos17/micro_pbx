@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- Callee side for rejected-BYE: answer like uas-answer-bye.xml, but reject
+     the callee BYE with 403 instead of 200. Exercises the post-teardown
+     final path: the 403 must route back to the callee (not bounce to the
+     caller) and remove the dialog without caching. Bob must already be
+     registered from this port. -->
+<scenario name="pbx-callee-bye-reject">
+  <recv request="INVITE" timeout="15000">
+  </recv>
+
+  <pause milliseconds="100"/>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 180 Ringing
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=sippbob3
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:bob@[local_ip]:[local_port]>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=sippbob3
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:bob@[local_ip]:[local_port]>
+      Content-Type: application/sdp
+      Content-Length: 88
+
+      v=0
+      o=bob 999 111 IN IP4 127.0.0.1
+      s=sipp
+      c=IN IP4 127.0.0.1
+      m=audio 4000 RTP/AVP 0
+
+    ]]>
+  </send>
+
+  <recv request="ACK" timeout="8000">
+  </recv>
+
+  <pause milliseconds="500"/>
+
+  <!-- Callee hangup, rejected by the caller (see the UAC scenario). -->
+  <send>
+    <![CDATA[
+      BYE sip:alice@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/UDP [local_ip]:[local_port];branch=z9hG4bKsipp-bob-bye3
+      Max-Forwards: 70
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      CSeq: 1 BYE
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="403" timeout="8000">
+  </recv>
+
+  <pause milliseconds="500"/>
+
+  <!-- End of call. -->
+</scenario>

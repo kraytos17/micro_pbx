@@ -6,7 +6,9 @@ How a datagram becomes a forwarded message. Anchors are current as of
 ## Event loop (`Pbx.run`, `src/pbx.zig:83`)
 Blocking `receiveTimeout` → parse → dispatch → `handleTimeout` (`:171`).
 The sleep duration is `min(server nextTimeout, dialog nextDialogTimeout,
-registrar sweep due)` (see `docs/timers.md`). Timeout handling is
+registrar sweep due)` (see `docs/timers.md`), capped at 20ms
+(`rtp_poll_interval_ms`) while any relay sockets are open: otherwise media sits
+unread between SIP events. Timeout handling is
 resend-before-sweep: retransmits go out before terminated entries are
 reaped. Registrar sweep runs at most every 60s (`:98`,
 `reg_sweep_interval_ms`, `src/pbx.zig:20`).
@@ -32,8 +34,9 @@ reaped. Registrar sweep runs at most every 60s (`:98`,
    `proxy.handleInvite` (100 to caller; branch minted; sent to contact).
 5. Dialog ensured (`Dialog{call, invite_txn, arena}`, `src/call.zig:38`)
    with the forwarded-INVITE client transaction for Timer A/B.
-6. Same-branch duplicates: retransmission detected → second 100 with no
-   re-forward and no new state.
+6. Same-branch duplicates: retransmission detected → absorbed silently:
+   no re-forward, no new state, no re-challenge (consumed nonces stay
+   consumed).
 
 ## Responses (`handleResponse`, `src/pbx.zig:522`)
 1. CANCEL responses terminate here (caller was already answered, `:532`).

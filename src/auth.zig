@@ -208,6 +208,43 @@ pub const Auth = struct {
         }
     }
 
+    /// Loads `user:password` lines (`#` comments and blanks skipped) and
+    /// seeds verifiers via addUser — passwords are never retained, so the
+    /// HA1-only invariant holds for file-loaded users too. Malformed lines
+    /// are warn-skipped, never fatal. Returns users loaded. An unreadable
+    /// file propagates to the caller (main falls back to seeds).
+    pub fn loadUsersFile(self: *Auth, path: []const u8) !usize {
+        const data = try std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(65536));
+        defer self.allocator.free(data);
+        return self.loadUsersData(path, data);
+    }
+
+    /// Parses users-file content (split for unit tests; see loadUsersFile).
+    pub fn loadUsersData(self: *Auth, path: []const u8, data: []const u8) !usize {
+        var loaded: usize = 0;
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+
+            const sep = std.mem.find(u8, line, ":") orelse {
+                log.warn("users file {s}: skipping malformed line", .{path});
+                continue;
+            };
+
+            const user = std.mem.trim(u8, line[0..sep], " \t");
+            const pass = std.mem.trim(u8, line[sep + 1 ..], " \t");
+            if (user.len == 0 or pass.len == 0) {
+                log.warn("users file {s}: skipping malformed line", .{path});
+                continue;
+            }
+
+            try self.addUser(user, pass);
+            loaded += 1;
+        }
+        return loaded;
+    }
+
     fn nowSecs(self: *Auth) i64 {
         return std.Io.Timestamp.now(self.io, std.Io.Clock.real).toSeconds();
     }
@@ -527,4 +564,41 @@ test "verifyRequest rejects qop tampering" {
     const stripped = try std.mem.replaceOwned(u8, std.testing.allocator, good, ", cnonce=\"abcdef0123456789\"", "");
     defer std.testing.allocator.free(stripped);
     try std.testing.expectError(error.BadResponse, auth.verifyRequest(authTestRequest(stripped)));
+}
+
+test "loadUsersData parses, skips junk, never retains passwords" {
+    const io = std.testing.io;
+    var auth = Auth.init(std.testing.allocator, io);
+    defer auth.deinit();
+
+    const loaded = try auth.loadUsersData("test", "# comment\n" ++
+        "\n" ++
+        "alice:alicepass\r\n" ++
+        "  bob  :  bobpass  \n" ++
+        "no-separator-here\n" ++
+        ":empty-user\n" ++
+        "empty-pass:\n" ++
+        "alice:newpass\n");
+    // 3 good lines (alice twice — reload overwrites), 3 malformed skipped.
+    try std.testing.expectEqual(@as(usize, 3), loaded);
+    try std.testing.expectEqual(md5Hex(&.{ "alice", ":", realm, ":", "newpass" }), auth.users.get("alice").?);
+    try std.testing.expectEqual(md5Hex(&.{ "bob", ":", realm, ":", "bobpass" }), auth.users.get("bob").?);
+    try std.testing.expect(auth.users.count() == 2);
+}
+
+test "loadUsersFile round-trips through the filesystem" {
+    const io = std.testing.io;
+    var auth = Auth.init(std.testing.allocator, io);
+    defer auth.deinit();
+
+    const path = "test-users.tmp";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "carol:carolpass\n" });
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const loaded = try auth.loadUsersFile(path);
+    try std.testing.expectEqual(@as(usize, 1), loaded);
+    try std.testing.expectEqual(md5Hex(&.{ "carol", ":", realm, ":", "carolpass" }), auth.users.get("carol").?);
+
+    // Missing file surfaces cleanly (main falls back to seeds on this).
+    try std.testing.expectError(error.FileNotFound, auth.loadUsersFile("no-such-users-file"));
 }
