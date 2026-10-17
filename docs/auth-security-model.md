@@ -12,12 +12,12 @@ the password (or HA1) at challenge time, and MD5's preimage resistance is
 unthreatened. The design puts its weight everywhere else.
 
 ## Storage: verifiers, never passwords
-`Auth.addUser` (`src/auth.zig:198`) hashes `user:realm:password` to HA1 at
+`Auth.addUser` (`src/auth.zig:202`) hashes `user:realm:password` to HA1 at
 seed time and stores only the 32-hex-char verifier (unit test
 `addUser stores HA1 verifiers, never passwords` asserts a stored entry can
 only be HA1). A database read yields challenge-answering power for live
 nonces (same as any digest deployment) but no password recovery, and
-test-only passwords live behind an explicit helper (`src/pbx.zig:715`),
+test-only passwords live behind an explicit helper (`src/pbx.zig:896`),
 never beside the verifier store.
 
 ## Challenge hygiene
@@ -25,27 +25,27 @@ never beside the verifier store.
   it. Replays get a fresh 401, proven live (`test_register_nonce_replay_fails`
   resends a captured Authorization byte-identical and gets 401).
 - **30s TTL + sweeper** (`nonce_ttl_secs`, `src/auth.zig:21`; sweep inline
-  at verify, `src/auth.zig:216-226`). Stolen challenges rot fast.
+  at issue, `src/auth.zig:258-270`). Stolen challenges rot fast.
 - **1024-entry cap** (`max_nonces`, `src/auth.zig:25`; arbitrary entries
-  evicted under pressure, `src/auth.zig:236`). Unauthenticated table growth
+  evicted under pressure, `src/auth.zig:277`). Unauthenticated table growth
   is bounded: INVITE floods can't OOM the nonce store.
 - **Accept-both qop.** `qop=auth` answers (bound to client nonce/nc/cnonce)
   and qop-less answers both verify; `qop` binds responses to client nonces
   where present. Covered live by `test_s1_register_qop` and at the builder
-  level (`clientResponse`, `src/auth.zig:131`).
+  level (`clientResponse`, `src/auth.zig:114`).
 
 ## No user enumeration
 All verification failures (unknown user, wrong password, bad nonce) take
 the identical path: `verifyRequest` errors → `sendUnauthorized`
-(`src/proxy.zig:212-218`), a plain 401 with a fresh nonce. The code comment
+(`src/proxy.zig:213-218`), a plain 401 with a fresh nonce. The code comment
 says it directly: *authentication failures are answers, not errors*.
 Locked in live by `test_register_unknown_user_challenged` (unknown user
 gets 401 + nonce, never 404) and in unit tests (`e2e REGISTER with wrong
-password stores nothing`, `src/pbx.zig:1049`).
+password stores nothing`, `src/pbx.zig:1374`).
 
 ## Stale handling
-Expired-but-once-valid nonces answer `stale=true` (`src/auth.zig:156`)
-and are explicitly re-challenged per RFC 3261 (`src/proxy.zig:216`), so
+Expired-but-once-valid nonces answer `stale=true` (`src/auth.zig:158`)
+and are explicitly re-challenged per RFC 3261 (`src/proxy.zig:218`), so
 honest clients with clock skew retry instead of failing.
 
 ## Explicit non-protections

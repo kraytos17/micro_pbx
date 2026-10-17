@@ -47,7 +47,7 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(scope="session")
 def logs_dir():
-    """Timestamped per-run archive + `latest` symlink (run.sh convention)."""
+    """Timestamped per-run archive + `latest` symlink for the latest run."""
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     d = INT / "logs" / run_id
     d.mkdir(parents=True)

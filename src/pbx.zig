@@ -236,6 +236,35 @@ pub const Pbx = struct {
 
     /// Handles a Timer B expiry: 408s the caller and tears down the call.
     /// Scans calls by invite branch (O(n), n is tiny; no index needed).
+    /// Shared 408-on-expiry send for the initial INVITE leg and any pending
+    /// re-INVITE leg. `reinvite` selects the Via/From/To snapshot and the
+    /// post-send action (teardown vs complete-and-keep); everything is
+    /// comptime-selected so emitted code matches the pre-extraction paths.
+    fn timeoutInviteTxn(self: *Pbx, dlg: *call.Dialog, call_id: []const u8, resp_buf: []u8, comptime reinvite: bool) void {
+        const call_ctx = &dlg.call;
+        const via = if (reinvite) (call_ctx.reinvite_via orelse return) else (call_ctx.caller_via orelse "");
+        const from = if (reinvite) (call_ctx.reinvite_from orelse "") else (call_ctx.caller_from orelse "");
+        const to = if (reinvite) (call_ctx.reinvite_to orelse "") else (call_ctx.caller_to orelse "");
+
+        const timeout_resp = proxy.buildTimeoutResponse(resp_buf, call_id, call_ctx.invite_cseq, via, from, to) catch |err| {
+            log.err("buildTimeoutResponse failed: {}", .{err});
+            return;
+        };
+
+        self.socket.sendTo(timeout_resp, call_ctx.caller_addr) catch |err| {
+            log.err("send 408 to caller failed: {}", .{err});
+            return;
+        };
+
+        if (reinvite) {
+            log.info("call {s} re-INVITE timed out (408), dialog kept", .{call_id});
+            dlg.completeInviteTxn(std.Io.Timestamp.now(self.io, std.Io.Clock.real).toMilliseconds());
+        } else {
+            log.info("call {s} terminated (408 Request Timeout)", .{call_id});
+            call.removeCall(&self.calls, self.allocator, call_id);
+        }
+    }
+
     fn onInviteTimeout(self: *Pbx, branch: []const u8) void {
         var it = self.calls.iterator();
         while (it.next()) |kv| {
@@ -245,24 +274,7 @@ pub const Pbx = struct {
             var resp_buf: [2048]u8 = undefined;
             if (call_ctx.invite_branch) |invite_branch| {
                 if (std.mem.eql(u8, invite_branch, branch)) {
-                    const timeout_resp = proxy.buildTimeoutResponse(
-                        &resp_buf,
-                        call_id,
-                        call_ctx.invite_cseq,
-                        call_ctx.caller_via orelse "",
-                        call_ctx.caller_from orelse "",
-                        call_ctx.caller_to orelse "",
-                    ) catch |err| {
-                        log.err("buildTimeoutResponse failed: {}", .{err});
-                        return;
-                    };
-
-                    self.socket.sendTo(timeout_resp, call_ctx.caller_addr) catch |err| {
-                        log.err("send 408 to caller failed: {}", .{err});
-                    };
-
-                    log.info("call {s} terminated (408 Request Timeout)", .{call_id});
-                    call.removeCall(&self.calls, self.allocator, call_id);
+                    self.timeoutInviteTxn(dlg, call_id, &resp_buf, false);
                     return;
                 }
             }
@@ -272,25 +284,7 @@ pub const Pbx = struct {
             // down over one unanswered re-INVITE would be wrong).
             if (dlg.invite_txn) |*t| {
                 if (std.mem.eql(u8, t.id.branch, branch)) {
-                    const via = call_ctx.reinvite_via orelse continue;
-                    const timeout_resp = proxy.buildTimeoutResponse(
-                        &resp_buf,
-                        call_id,
-                        call_ctx.invite_cseq,
-                        via,
-                        call_ctx.reinvite_from orelse "",
-                        call_ctx.reinvite_to orelse "",
-                    ) catch |err| {
-                        log.err("buildTimeoutResponse failed: {}", .{err});
-                        return;
-                    };
-
-                    self.socket.sendTo(timeout_resp, call_ctx.caller_addr) catch |err| {
-                        log.err("send 408 to caller failed: {}", .{err});
-                    };
-
-                    log.info("call {s} re-INVITE timed out (408), dialog kept", .{call_id});
-                    dlg.completeInviteTxn(std.Io.Timestamp.now(self.io, std.Io.Clock.real).toMilliseconds());
+                    self.timeoutInviteTxn(dlg, call_id, &resp_buf, true);
                     return;
                 }
             }
@@ -374,9 +368,7 @@ pub const Pbx = struct {
             const contact = self.reg.lookup(dest_aor) orelse {
                 log.warn("INVITE {s} not found, sending 404", .{dest_aor});
                 // Build once into resp_buf: the same bytes go out on the
-                // wire and into the retransmit cache (top Via echoed
-                // unchanged). Previously built twice (buildResponse for
-                // the cache plus sendResponseWithBranch re-emitting).
+                // wire and into the retransmit cache.
                 const response_404 = try proxy.buildResponse(resp_buf, 404, "Not Found", req, null);
 
                 try self.socket.sendTo(response_404, from);
@@ -402,44 +394,7 @@ pub const Pbx = struct {
             // can rewrite the callee's SDP and open relay sockets on ACK.
             // The forwarded INVITE carries SDP rewritten toward the PBX so
             // the callee's media flows through the relay (not direct).
-            var invite_req = req;
-            if (req.content_type) |ct| {
-                if (std.mem.eql(u8, ct, "application/sdp") and req.body.len > 0) {
-                    if (sdp.parseSdp(req.body)) |media| {
-                        const session = try self.rtp_sessions.createSession(req.call_id, media.port, from, media.payload_type);
-                        invite_req.body = try sdp.rewriteSdp(req.body, "127.0.0.1", session.relay_callee_port, arena);
-                    } else |_| {
-                        log.warn("could not parse caller SDP in INVITE", .{});
-                    }
-                }
-            }
-
-            var branch_buf: [32]u8 = undefined;
-            const invite_result = try proxy.handleInvite(invite_req, from, contact, &self.socket, self.pbx_addr, resp_buf, fwd_buf, &branch_buf, self.io);
-
-            // Ensure the dialog (dlg_ptr may have dangled across a rehash;
-            // use dlg2 below, never dlg_ptr past this point).
-            const dlg2 = try call.ensureDialog(&self.calls, self.allocator, req.call_id, .{ .caller_addr = from });
-            const ctx = &dlg2.call;
-            ctx.callee_contact_addr = contact.address;
-
-            // Client transaction lives in the dialog (arena-owned buffers).
-            // Under pressure the forward still stands; only tracking drops.
-            const now_ms = std.Io.Timestamp.now(self.io, std.Io.Clock.real).toMilliseconds();
-            if (txn.makeTransaction(dlg2.arena.allocator(), now_ms, invite_result.branch, .INVITE, .invite, invite_result.forwarded, contact.address)) |t| {
-                dlg2.invite_txn = t;
-            } else |err| {
-                log.warn("untracked INVITE leg under pressure: {}", .{err});
-            }
-
-            const dialog_alloc = dlg2.arena.allocator();
-            ctx.invite_branch = dialog_alloc.dupe(u8, invite_result.branch) catch null;
-            ctx.caller_via = dialog_alloc.dupe(u8, req.via) catch null;
-            ctx.caller_from = dialog_alloc.dupe(u8, req.from) catch null;
-            ctx.caller_to = dialog_alloc.dupe(u8, req.to) catch null;
-            ctx.invite_cseq = req.cseq_num;
-            // invite_result.branch borrows our branch_buf above; the arena
-            // dupes (txn + invite_branch) already hold copies past return.
+            try self.forwardNewInvite(req, from, contact, arena, resp_buf, fwd_buf);
         } else {
             // Established dialog, higher CSeq: caller-initiated re-INVITE
             // renegotiation (new SDP offer). Everything else absorbs
@@ -460,6 +415,53 @@ pub const Pbx = struct {
             // UAs with out-of-step responses.
             log.debug("absorbed duplicate INVITE {s} branch {s}", .{ req.call_id, req.via_branch });
         }
+    }
+
+    /// Forwards a new (non-retransmit, non-duplicate) INVITE: RTP session,
+    /// SDP rewrite, 100 + forward, dialog + client transaction, 408
+    /// context. Extracted from onInvite unchanged; takes the scratch arena
+    /// explicitly since rewritten SDP must outlive the call.
+    fn forwardNewInvite(self: *Pbx, req: msg.Request, from: std.Io.net.IpAddress, contact: registrar.Contact, arena: std.mem.Allocator, resp_buf: []u8, fwd_buf: []u8) !void {
+        // Create an RTP session from the caller's SDP so the media relay
+        // can rewrite the callee's SDP and open relay sockets on ACK.
+        // The forwarded INVITE carries SDP rewritten toward the PBX so
+        // the callee's media flows through the relay (not direct).
+        var invite_req = req;
+        if (req.content_type) |ct| {
+            if (std.mem.eql(u8, ct, "application/sdp") and req.body.len > 0) {
+                if (sdp.parseSdp(req.body)) |media| {
+                    const session = try self.rtp_sessions.createSession(req.call_id, media.port, from, media.payload_type);
+                    invite_req.body = try sdp.rewriteSdp(req.body, "127.0.0.1", session.relay_callee_port, arena);
+                } else |_| {
+                    log.warn("could not parse caller SDP in INVITE", .{});
+                }
+            }
+        }
+
+        var branch_buf: [32]u8 = undefined;
+        const invite_result = try proxy.handleInvite(invite_req, from, contact, &self.socket, self.pbx_addr, resp_buf, fwd_buf, &branch_buf, self.io);
+
+        // Ensure the dialog (the caller's dlg_ptr may have dangled across a
+        // rehash; use dlg2 below, never the caller's pointer past this point).
+        const dlg2 = try call.ensureDialog(&self.calls, self.allocator, req.call_id, .{ .caller_addr = from });
+
+        const ctx = &dlg2.call;
+        ctx.callee_contact_addr = contact.address;
+        // Client transaction lives in the dialog (arena-owned buffers).
+        // Under pressure the forward still stands; only tracking drops.
+        const now_ms = std.Io.Timestamp.now(self.io, std.Io.Clock.real).toMilliseconds();
+        if (txn.makeTransaction(dlg2.arena.allocator(), now_ms, invite_result.branch, .INVITE, .invite, invite_result.forwarded, contact.address)) |t| {
+            dlg2.invite_txn = t;
+        } else |err| {
+            log.warn("untracked INVITE leg under pressure: {}", .{err});
+        }
+
+        const dialog_alloc = dlg2.arena.allocator();
+        ctx.invite_branch = dialog_alloc.dupe(u8, invite_result.branch) catch null;
+        ctx.caller_via = dialog_alloc.dupe(u8, req.via) catch null;
+        ctx.caller_from = dialog_alloc.dupe(u8, req.from) catch null;
+        ctx.caller_to = dialog_alloc.dupe(u8, req.to) catch null;
+        ctx.invite_cseq = req.cseq_num;
     }
 
     /// Forwards a caller-initiated re-INVITE on an established dialog: new
@@ -661,6 +663,59 @@ pub const Pbx = struct {
         return call_ctx.caller_addr;
     }
 
+    /// Shared tail for failed INVITE finals: forward the response, cache it
+    /// for retransmit replays, complete the client transaction, remove the
+    /// dialog. The only difference between callers is one word in an
+    /// error-path log line, passed at comptime so output stays
+    /// byte-identical (that path never fires in green runs and is
+    /// unasserted, but there is no reason to churn it).
+    fn settleFailedInvite(self: *Pbx, dlg: *call.Dialog, resp: msg.Response, data: []u8, from: std.Io.net.IpAddress, dest_addr: std.Io.net.IpAddress, fwd_buf: []u8, comptime log_ctx: []const u8) void {
+        proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
+            log.err("handleResponse " ++ log_ctx ++ ": {}", .{err});
+        };
+
+        dlg.storeInviteResponse(data) catch |err| {
+            log.err("storeInviteResponse failed: {}", .{err});
+        };
+        dlg.completeInviteTxn(std.Io.Timestamp.now(self.io, std.Io.Clock.real).toMilliseconds());
+        // Cache under the caller's branch too, so a caller INVITE
+        // retransmit replays instead of re-forwarding.
+        if (resp.via_branch2.len > 0) {
+            self.cacheErrorResponse(resp.via_branch2, resp.cseq_method, data, dest_addr);
+        }
+        call.removeCall(&self.calls, self.allocator, resp.call_id);
+    }
+
+    /// Shared body for a 2xx to the initial INVITE leg: record the callee,
+    /// drop the now-dead 408 context, forward, end the client transaction
+    /// (RFC 3261: no Timer D on 2xx). The CANCEL-race path differs only in
+    /// its log lines; `raced` is comptime so every emitted byte (including
+    /// error paths) is identical to before.
+    fn answerInvite(self: *Pbx, dlg: *call.Dialog, resp: msg.Response, data: []u8, from: std.Io.net.IpAddress, dest_addr: std.Io.net.IpAddress, fwd_buf: []u8, comptime raced: bool) void {
+        const call_ctx = &dlg.call;
+        call_ctx.state = .answered;
+        if (raced) {
+            log.info("call {s} answered after CANCEL race ({d} {s})", .{ resp.call_id, resp.status_code, resp.reason_phrase });
+        } else {
+            log.info("call {s} answered ({d} {s})", .{ resp.call_id, resp.status_code, resp.reason_phrase });
+        }
+
+        call_ctx.callee_resp_addr = from;
+        // Pre-answer 408 context is dead weight from here;
+        // the arena reclaims it at teardown.
+        call_ctx.caller_via = null;
+        call_ctx.caller_from = null;
+        call_ctx.caller_to = null;
+        proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
+            if (raced) {
+                log.err("handleResponse 2xx race: {}", .{err});
+            } else {
+                log.err("handleResponse 2xx: {}", .{err});
+            }
+        };
+        dlg.invite_txn = null;
+    }
+
     fn handleResponse(
         self: *Pbx,
         resp: msg.Response,
@@ -696,30 +751,9 @@ pub const Pbx = struct {
                 .success => {
                     if (resp.cseq_method == .INVITE) {
                         if (call_ctx.state == .proceeding or call_ctx.state == .ringing) {
-                            call_ctx.state = .answered;
-                            log.info("call {s} answered ({d} {s})", .{ resp.call_id, resp.status_code, resp.reason_phrase });
-                            call_ctx.callee_resp_addr = from;
-                            // Pre-answer 408 context is dead weight from here;
-                            // the arena reclaims it at teardown.
-                            call_ctx.caller_via = null;
-                            call_ctx.caller_from = null;
-                            call_ctx.caller_to = null;
-                            proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
-                                log.err("handleResponse 2xx: {}", .{err});
-                            };
-                            // RFC 3261: INVITE client transaction ends on 2xx, no Timer D.
-                            dlg.invite_txn = null;
+                            self.answerInvite(dlg, resp, data, from, dest_addr, fwd_buf, false);
                         } else if (call_ctx.state == .canceling) {
-                            call_ctx.state = .answered;
-                            log.info("call {s} answered after CANCEL race ({d} {s})", .{ resp.call_id, resp.status_code, resp.reason_phrase });
-                            call_ctx.callee_resp_addr = from;
-                            call_ctx.caller_via = null;
-                            call_ctx.caller_from = null;
-                            call_ctx.caller_to = null;
-                            proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
-                                log.err("handleResponse 2xx race: {}", .{err});
-                            };
-                            dlg.invite_txn = null;
+                            self.answerInvite(dlg, resp, data, from, dest_addr, fwd_buf, true);
                         } else if (call_ctx.state == .established) {
                             // Answer to a re-INVITE: forward to the caller and
                             // record the (possibly new) callee endpoint, but
@@ -763,37 +797,11 @@ pub const Pbx = struct {
                     if (resp.status_code == 487 and call_ctx.state == .canceling) {
                         call_ctx.state = .terminated;
                         log.info("call {s} terminated (487)", .{resp.call_id});
-                        proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
-                            log.err("handleResponse 487: {}", .{err});
-                        };
-                        dlg.storeInviteResponse(data) catch |err| {
-                            log.err("storeInviteResponse failed: {}", .{err});
-                        };
-
-                        dlg.completeInviteTxn(std.Io.Timestamp.now(self.io, std.Io.Clock.real).toMilliseconds());
-                        // Cache under the caller's branch too, so a caller
-                        // INVITE retransmit replays instead of re-forwarding.
-                        if (resp.via_branch2.len > 0) {
-                            self.cacheErrorResponse(resp.via_branch2, resp.cseq_method, data, dest_addr);
-                        }
-                        call.removeCall(&self.calls, self.allocator, resp.call_id);
+                        self.settleFailedInvite(dlg, resp, data, from, dest_addr, fwd_buf, "487");
                     } else if (call_ctx.state != .terminated) {
                         call_ctx.state = .terminated;
                         log.info("call {s} terminated ({d} {s})", .{ resp.call_id, resp.status_code, resp.reason_phrase });
-                        proxy.handleResponse(resp, dest_addr, from, &self.socket, data, &self.rtp_sessions, self.allocator, fwd_buf) catch |err| {
-                            log.err("handleResponse final: {}", .{err});
-                        };
-                        dlg.storeInviteResponse(data) catch |err| {
-                            log.err("storeInviteResponse failed: {}", .{err});
-                        };
-
-                        dlg.completeInviteTxn(std.Io.Timestamp.now(self.io, std.Io.Clock.real).toMilliseconds());
-                        // Cache under the caller's branch too, so a caller
-                        // INVITE retransmit replays instead of re-forwarding.
-                        if (resp.via_branch2.len > 0) {
-                            self.cacheErrorResponse(resp.via_branch2, resp.cseq_method, data, dest_addr);
-                        }
-                        call.removeCall(&self.calls, self.allocator, resp.call_id);
+                        self.settleFailedInvite(dlg, resp, data, from, dest_addr, fwd_buf, "final");
                     } else if (resp.cseq_method != .INVITE) {
                         // Post-teardown non-INVITE final (e.g. a rejected
                         // callee-BYE: onBye already terminated the dialog at

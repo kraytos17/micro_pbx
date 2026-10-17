@@ -84,15 +84,15 @@ registration, call setup/teardown, instant messaging, and media relay
 ```sh
 zig build            # builds ./zig-out/bin/micro_pbx
 zig build run        # build and run the PBX
-zig build test       # run all 131 unit tests
+zig build test       # run all 138 unit tests
 ```
 
 The PBX listens on UDP `0.0.0.0:5060` by default
 (`Pbx.init(allocator, io, 5060)` in `src/main.zig`).
 
-### Unit tests (131)
+### Unit tests (138)
 
-`zig test src/main.zig`: 129 named tests plus 2 `refAllDecls` blocks:
+`zig test src/main.zig`: 136 named tests plus 2 `refAllDecls` blocks:
 
 | Module | Tests | Covers |
 |---|---|---|
@@ -147,7 +147,7 @@ format if a tool ever demands it).
 | `callee_bye` | Python caller answers callee BYE with 200 |
 | `callee_bye_rejected` | caller rejects callee BYE with 403 → routed to callee, dialog removed (probe BYE gets 481), nothing cached |
 | `s9_rtp_relay` | live media loop: RTP to relay port from SDP port → echo UAS → byte-identical ordered echoes, both directions logged |
-| `s10_reinvite` | caller re-INVITE mid-dialog (new SDP port 20002): forwarded rewritten, answered in established state, echo loop follows, teardown |
+| `s10_reinvite` | established-dialog re-INVITE with new SDP port: forwarded rewritten, answered in established state, echo loop follows the new port, full teardown |
 | `s8_timer_b` (slow) | Python caller handshakes with silent contact then lingers: 408 at 32.000s after the forwarded leg (Timer B), teardown |
 | `no_errors` (always last) | zero `] error(` lines in the whole run's PBX log |
 
@@ -211,7 +211,7 @@ src/
     └── transaction.zig # timers, retransmission, response cache
 interop.sh            # repo-root wrapper (prereq checks, --slow, pytest passthrough)
 interop/
-├── test_interop.py    # 13 ordered live scenarios (file order = run order)
+├── test_interop.py    # 17 ordered live scenarios (file order = run order)
 ├── conftest.py        # PBX lifecycle, log archiving, sipp runners, log-growth asserts
 ├── register.py        # digest-auth REGISTER client (importable + CLI)
 ├── sipassert.py       # structured sipp-log parser + sipp counter gate

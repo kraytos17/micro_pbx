@@ -8,7 +8,7 @@ produced at least one real flake or false-pass.
 instances concurrently.** Both suites emit real UDP on loopback, and sipp
 aborts on any unexpected datagram. The recorded incident: a parallel
 `zig test` sent a 401 for `alicereg@127.0.0.1` (format-built as
-`{name}reg@…` in `registerHandshake`, `src/pbx.zig:724`; invisible to
+`{name}reg@…` in `registerHandshake`, `src/pbx.zig:860`; invisible to
 literal grep) from `test_alice_addr` (then `127.0.0.1:5070`) into the S4
 UAS socket. Fix was port separation (unit peers moved to 5090/5092), but
 separation only covers *known* collisions. Serial execution covers unknown
@@ -23,7 +23,7 @@ Fixed: the PBX routes by source address, so these are load-bearing:
 | 5061 | sipp caller (UAC) | `UAC_PORT`, `interop/conftest.py` |
 | 5063 | silent contact | nothing listens; must differ from 5061, or INVITEs route back to the caller |
 | 5070 | sipp callee (UAS) / registered-contact port | `UAS_PORT` |
-| 5090 / 5092 | unit-test peers | `test_alice_addr` / `test_bob_addr`, `src/pbx.zig:664-666` |
+| 5090 / 5092 | unit-test peers | `test_alice_addr` / `test_bob_addr`, `src/pbx.zig:845-847` |
 | 20000 | Python caller RTP (bound by `MediaSocket`, matches offered SDP) | media must originate here (exact-endpoint match) |
 | 20002 | re-INVITE caller RTP (rebound `MediaSocket`, S10 port move) | same rule after renegotiation |
 | 4000–4001 | sipp UAS media+RTCP (pinned via `-min/-max_rtp_port`) | must equal the hardcoded `m=audio 4000` (PBX matches declared ports) |

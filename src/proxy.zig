@@ -302,22 +302,10 @@ pub fn sendResponse(
     reason: []const u8,
     req: msg.Request,
 ) !void {
-    sendResponseWithBranch(socket, to, buf, status, reason, req) catch |err| return err;
-}
-
-pub fn sendResponseWithBranch(
-    socket: *transport.UdpSocket,
-    to: std.Io.net.IpAddress,
-    buf: []u8,
-    status: u16,
-    reason: []const u8,
-    req: msg.Request,
-) !void {
     var w = std.Io.Writer.fixed(buf);
     try emit(&w, "SIP/2.0 {d} {s}\r\n", .{ status, reason });
     // Echo the top Via unchanged; see buildResponse.
     try emit(&w, "Via: {s}\r\n", .{req.via});
-
     try emit(&w, "From: {s}\r\n", .{req.from});
     try emit(&w, "To: {s}\r\n", .{req.to});
     try emit(&w, "Call-ID: {s}\r\n", .{req.call_id});
